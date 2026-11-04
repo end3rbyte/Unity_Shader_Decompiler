@@ -506,7 +506,15 @@ public static class HlslPrettyPrinter
                 break;
 
             case HlslResourceKind.Texture:
-                sb.Append("            ").Append(res.TypeHint ?? "Texture2D").Append(' ').Append(res.Name).Append(regSuffix).Append(";\n");
+                if (res.StructureStride > 0)
+                {
+                    sb.Append("            struct ").Append(res.Name).Append("_element { uint value[")
+                      .Append(res.StructureStride / 4).Append("]; };\n");
+                    sb.Append("            StructuredBuffer<").Append(res.Name).Append("_element> ")
+                      .Append(res.Name).Append(regSuffix).Append(";\n");
+                }
+                else
+                    sb.Append("            ").Append(res.TypeHint ?? "Texture2D").Append(' ').Append(res.Name).Append(regSuffix).Append(";\n");
                 break;
 
             case HlslResourceKind.Sampler:
@@ -1475,12 +1483,7 @@ public static class HlslPrettyPrinter
         {
             case HlslIfStatement iff:
             {
-                // Cross-branch phi copies (IRLeaveSsa writes the same
-                // post-merge name at the top level of BOTH arms) must have
-                // their declaration hoisted above the if. Declared per-arm,
-                // the name is scoped to that arm's braces and dies at the
-                // `}` — the sibling arm's write and any post-merge read
-                // would then reference an identifier never in scope.
+                // Declare branch-written values outside the if so later reads remain in scope.
                 foreach ((string name, int comps) in CrossBranchMergeNames(iff, ctx))
                 {
                     if (!ctx.Declared.Add(name))
@@ -2281,7 +2284,9 @@ public static class HlslPrettyPrinter
         IRExpression.DotProductExpression => 1,
         IRExpression.SwizzleExpression s => Math.Max(1, s.Components.Count),
         IRExpression.MatrixVectorMultiplyExpression mv => Math.Max(1, mv.Rows.Count),
-        IRExpression.TextureOperationExpression tex => TextureOpWidth(tex.Operation),
+        IRExpression.TextureOperationExpression tex => tex.Operation == IRExpression.TextureOperation.LoadStructured
+            ? Math.Max(1, MaskIndices(tex.DestinationMask).Count)
+            : TextureOpWidth(tex.Operation),
         _ => 1,
     };
 
@@ -2355,20 +2360,42 @@ public static class HlslPrettyPrinter
     // HlslIfStatement print case). Returns (rendered name, component count
     // for the declaration type), mirroring the exact naming/typing
     // RenderAssignmentLines will produce when it prints those same writes.
-    private static List<(string Name, int Components)> CrossBranchMergeNames(HlslIfStatement iff, PrintContext ctx)
+    private static Dictionary<string, int> CrossBranchMergeNames(HlslIfStatement iff, PrintContext ctx)
     {
-        var result = new List<(string, int)>();
+        var result = new Dictionary<string, int>();
         if (iff.Else is null)
             return result;
-
-        Dictionary<string, int> thenNames = WrittenDeclNames(iff.Then.Statements, ctx);
-        Dictionary<string, int> elseNames = WrittenDeclNames(iff.Else.Statements, ctx);
-
+        var thenNames = new Dictionary<string, int>();
+        var elseNames = new Dictionary<string, int>();
+        AddNames(iff.Then, thenNames, ctx);
+        AddNames(iff.Else, elseNames, ctx);
         foreach ((string name, int comps) in thenNames)
-            if (elseNames.TryGetValue(name, out int elseComps))
-                result.Add((name, Math.Max(comps, elseComps)));
-
+            result[name] = comps;
+        foreach ((string name, int comps) in elseNames)
+            result[name] = Math.Max(result.GetValueOrDefault(name), comps);
         return result;
+    }
+
+    private static void AddNames(HlslBlockStatement block, Dictionary<string, int> names, PrintContext ctx)
+    {
+        foreach ((string name, int comps) in WrittenDeclNames(block.Statements, ctx))
+            if (!names.TryGetValue(name, out int prev) || comps > prev)
+                names[name] = comps;
+
+        foreach (HlslStatementNode stmt in block.Statements)
+            switch (stmt)
+            {
+                case HlslIfStatement nested:
+                    AddNames(nested.Then, names, ctx);
+                    if (nested.Else is not null) AddNames(nested.Else, names, ctx);
+                    break;
+                case HlslLoopStatement loop:
+                    AddNames(loop.Body, names, ctx);
+                    break;
+                case HlslSwitchStatement sw:
+                    foreach (HlslSwitchCase c in sw.Cases) AddNames(c.Body, names, ctx);
+                    break;
+            }
     }
 
     // Names first written at the top level of a loop body that are not yet
@@ -2594,11 +2621,17 @@ public static class HlslPrettyPrinter
         // Casts use C-style cast syntax, not a function call.
         switch (expr.Intrinsic)
         {
-            case IRExpression.IRIntrinsic.CastFloat: return $"(float)({Arg(0)})";
-            case IRExpression.IRIntrinsic.CastInt: return $"(int)({Arg(0)})";
-            case IRExpression.IRIntrinsic.CastUInt: return $"(uint)({Arg(0)})";
-            case IRExpression.IRIntrinsic.CastDouble: return $"(double)({Arg(0)})";
-            case IRExpression.IRIntrinsic.CastBool: return $"(bool)({Arg(0)})";
+            case IRExpression.IRIntrinsic.CastFloat: return $"({CastType("float")})({Arg(0)})";
+            case IRExpression.IRIntrinsic.CastInt: return $"({CastType("int")})({Arg(0)})";
+            case IRExpression.IRIntrinsic.CastUInt: return $"({CastType("uint")})({Arg(0)})";
+            case IRExpression.IRIntrinsic.CastDouble: return $"({CastType("double")})({Arg(0)})";
+            case IRExpression.IRIntrinsic.CastBool: return $"({CastType("bool")})({Arg(0)})";
+        }
+
+        string CastType(string scalar)
+        {
+            int width = ExpressionWidth(expr.Arguments[0], ctx);
+            return width <= 1 ? scalar : $"{scalar}{width}";
         }
 
         string? name = expr.Intrinsic switch
@@ -2691,6 +2724,9 @@ public static class HlslPrettyPrinter
     // needed fixing up from the debug ToString().
     private static string RenderTextureOp(IRExpression.TextureOperationExpression tex, PrintContext ctx)
     {
+        if (tex.Operation == IRExpression.TextureOperation.LoadStructured)
+            return RenderStructuredLoad(tex, ctx);
+
         string resource = RenderRegisterRead(tex.Resource, ctx);
         string? sampler = tex.Sampler is null ? null : RenderRegisterRead(tex.Sampler, ctx);
         string? coord = tex.Coordinates is null ? null : RenderExpression(tex.Coordinates, ctx);
@@ -2742,5 +2778,30 @@ public static class HlslPrettyPrinter
             _ =>
                 $"/* TODO: no confirmed HLSL mapping for {tex.Operation} */ {resource}.{tex.Operation}({Args(sampler, coord)})",
         };
+    }
+
+    private static string RenderStructuredLoad(IRExpression.TextureOperationExpression tex, PrintContext ctx)
+    {
+        if (tex.Coordinates is null || tex.Offset is not IRExpression.ConstantExpression { RawValues.Length: 1 } offset)
+            throw new InvalidDataException("Structured load requires an element index and a constant byte offset.");
+        uint byteOffset = offset.RawValues[0];
+        if (byteOffset % 4 != 0)
+            throw new InvalidDataException($"Unaligned structured load offset {byteOffset}.");
+
+        List<int> lanes = MaskIndices(tex.DestinationMask);
+        if (lanes.Count == 0)
+            throw new InvalidDataException("Structured load has no destination lanes.");
+        List<int> swizzle = ActiveComponents(tex.Resource);
+        var values = new List<string>();
+        foreach (int lane in lanes)
+        {
+            uint word = byteOffset / 4 + (uint)swizzle[lane];
+            if (word >= tex.StructuredStride / 4)
+                throw new InvalidDataException($"Structured load exceeds element stride at t{tex.Resource.Index}.");
+            values.Add($"t{tex.Resource.Index}[{RenderExpression(tex.Coordinates, ctx)}].value[{word}]");
+        }
+        return lanes.Count == 1
+            ? $"asfloat({values[0]})"
+            : $"asfloat(uint{lanes.Count}({string.Join(", ", values)}))";
     }
 }
