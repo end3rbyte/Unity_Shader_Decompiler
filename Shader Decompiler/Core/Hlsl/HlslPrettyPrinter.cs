@@ -355,6 +355,14 @@ public static class HlslPrettyPrinter
 
     private static void PrintResource(StringBuilder sb, HlslResourceNode res, bool stripRegisterBindings, Dictionary<string, string>? cbufferRenames = null)
     {
+        if (res.Kind == HlslResourceKind.ConstantBuffer
+            && res.Variables.FirstOrDefault(v => v.Name == $"cb{res.Slot}_values" && v.ArraySize is not null) is { } raw)
+        {
+            sb.Append("            cbuffer ").Append(CbufferName(res)).Append(" : register(b").Append(res.Slot)
+              .Append(") { float4 ").Append(raw.Name).Append('[').Append(raw.ArraySize).Append("]; };\n");
+            return;
+        }
+
         // Unity standard cbuffers are assigned to per-stage slots by Unity's
         // compiler from the cbuffer NAME alone — an explicit register binding
         // would conflict when vertex and fragment map the same name to
@@ -376,9 +384,7 @@ public static class HlslPrettyPrinter
                 // same name causes "Duplicate constant buffer declaration".
                 // Rename them while keeping ALL variables and the register
                 // binding so the bytecode still reads from the correct slot.
-                string cbufferName = IsUnityCbuffer(res.Name)
-                    ? $"_{res.Name.TrimStart('_')}CB_b{res.Slot}"
-                    : res.Name;
+                string cbufferName = CbufferName(res);
 
                 sb.Append("            cbuffer ").Append(cbufferName);
                 if (!string.IsNullOrEmpty(reg))
@@ -549,6 +555,11 @@ public static class HlslPrettyPrinter
     private static bool IsUnityCbuffer(string name) =>
         name.StartsWith("Unity", StringComparison.Ordinal) || name == "_Globals";
 
+    // A partial member layout does not invalidate the recovered buffer identity.
+    private static string CbufferName(HlslResourceNode resource) => IsUnityCbuffer(resource.Name)
+        ? $"_{resource.Name.TrimStart('_')}CB_b{resource.Slot}"
+        : resource.Name;
+
     // ---------- Stage 8: Structs ----------
 
     private static void PrintStruct(StringBuilder sb, HlslStructNode s)
@@ -575,6 +586,7 @@ public static class HlslPrettyPrinter
 
         public bool PreserveArithmetic { get; init; }
         public bool RawTemporaryStorage { get; init; }
+        public HashSet<int> RawCbufferSlots { get; } = new();
 
         // Identifier each defining instruction actually declared for a
         // value, keyed by the value's structural identity (storage location
@@ -671,6 +683,9 @@ public static class HlslPrettyPrinter
         if (resources is not null)
             foreach (HlslResourceNode res in resources)
             {
+                if (res.Kind == HlslResourceKind.ConstantBuffer
+                    && res.Variables.Any(v => v.Name == $"cb{res.Slot}_values" && v.ArraySize is not null))
+                    ctx.RawCbufferSlots.Add((int)res.Slot);
                 if (res.Kind == HlslResourceKind.Texture)
                 {
                     ctx.TextureTypeBySlot[(int)res.Slot] = res.TypeHint ?? "Texture2D";
@@ -1667,6 +1682,8 @@ public static class HlslPrettyPrinter
     //   3. synthesized cbN_values[slot] fallback array.
     private static string RenderCbufferRead(IRRegister reg, PrintContext ctx)
     {
+        if (reg.Indices.Count >= 2 && ctx.RawCbufferSlots.Contains((int)reg.Indices[0]))
+            return CbufferElementName(reg, ctx) + MaskOrSwizzleSuffix(reg);
         if (reg.SymbolicName is not null)
         {
             string name = reg.SymbolicName;
