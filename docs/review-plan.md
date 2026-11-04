@@ -1,6 +1,6 @@
 # Review plan
 
-The former aggregate branch is split into eleven focused draft PRs based on upstream `1850608`. Register bit preservation and structured loads are reviewed together in #10; the redundant #7 is closed. Review the input-compatibility fix (#6) first to resolve the PicaVoxel extraction regression. The numeric-formatting fix (#5) also removes the upstream French-locale golden-test failure.
+The former aggregate branch is split into twelve focused draft PRs based on upstream `1850608`. Register bit preservation and structured loads are reviewed together in #10; the redundant #7 is closed. Review the input-compatibility fix (#6) first to resolve the PicaVoxel extraction regression. The numeric-formatting fix (#5) also removes the upstream French-locale golden-test failure.
 
 | PR | Scope | Branch |
 | --- | --- | --- |
@@ -11,16 +11,17 @@ The former aggregate branch is split into eleven focused draft PRs based on upst
 | [#5](https://github.com/Abby1591/Unity_Shader_Decompiler/pull/5) | Use invariant numeric literals in shader output | `fix/invariant-numeric-output` |
 | [#6](https://github.com/Abby1591/Unity_Shader_Decompiler/pull/6) | Accept AssetStudio and AssetRipper shader JSON schemas | `fix/metadata-offset-schemas` |
 | [#8](https://github.com/Abby1591/Unity_Shader_Decompiler/pull/8) | Preserve resource bindings and raw constant-buffer layout | `fix/resource-binding-layouts` |
-| [#9](https://github.com/Abby1591/Unity_Shader_Decompiler/pull/9) | Pair shader variants using serialized program references | `fix/serialized-variant-pairing` |
+| [#9](https://github.com/Abby1591/Unity_Shader_Decompiler/pull/9) | Restore runtime keyword selection from serialized variants | `fix/serialized-variant-pairing` |
 | [#10](https://github.com/Abby1591/Unity_Shader_Decompiler/pull/10) | Preserve register bits and structured-buffer loads | `fix/structured-buffer-loads` |
 | [#11](https://github.com/Abby1591/Unity_Shader_Decompiler/pull/11) | Keep temporary register identities distinct | `fix/temporary-register-names` |
 | [#12](https://github.com/Abby1591/Unity_Shader_Decompiler/pull/12) | Preserve vector lanes in casts and dot products | `fix/vector-expression-widths` |
+| [#13](https://github.com/Abby1591/Unity_Shader_Decompiler/pull/13) | Preserve serialized integer shader properties | `fix/integer-shader-properties` |
 
 Each branch carries its own generic regression tests and validation notes. All four PicaVoxel end-to-end tests pass on every branch. Except for the numeric-formatting branch, C# isolation runs use an en-US default culture because upstream's golden comparison already fails under fr-FR. The combined checkout passes under fr-FR without that override.
 
 Several emitter PRs regenerate the same golden file. After merging more than one, regenerate that reference from the combined emitter instead of choosing one branch's snapshot or editing shader text.
 
-`integration/review-validation` is the combined validation checkout, not another upstream PR. The obsolete aggregate branch was deleted. All review changes were merged from upstream, and the reference shader was regenerated through the combined emitter. Combined validation: 87 C# tests, 14 Python tests and all four PicaVoxel end-to-end cases pass. No new C# `var`, proprietary fixtures or local machine paths are included in the upstream PRs.
+`integration/review-validation` is the combined validation checkout, not another upstream PR. The obsolete aggregate branch was deleted. All review changes were merged from upstream, and the reference shader was regenerated through the combined emitter. Combined validation: 117 C# tests, 18 Python tests and all four PicaVoxel end-to-end cases pass. No new C# `var`, proprietary fixtures or local machine paths are included in the upstream PRs.
 
 Two local shaders were independently exported with AssetStudioMod CLI v0.20.0 and AssetRipper from the same bundle. All four pipelines passed native compilation and deterministic DXBC execution comparison. Normalized metadata, decompressed blobs, generated shader/program files and serialized constant inputs match across exporters. The source JSON files and game data stay local.
 
@@ -33,3 +34,9 @@ Two local shaders were independently exported with AssetStudioMod CLI v0.20.0 an
 Fresh isolated validation (Windows): #6 has 51 C# / 10 Python tests, #9 has 54 C# / 2 Python tests, and the combined #10 has 65 C# tests. All four PicaVoxel cases pass in each checkout. Other follow-up changes only clarify PR descriptions; their previous validation remains recorded in their individual documents.
 
 The new native tests recompile with d3dcompiler and evaluate a restricted bit-copy instruction set against explicit expected words. They reject unexpected operations and are not GPU execution tests. External fixture results above describe the earlier local validation, not a new run in this follow-up.
+
+## Runtime validation follow-up
+
+#9 now offers opt-in runtime keyword reconstruction within the original passes, with strict metadata checks and a hash-bound compilation manifest. Its isolated suite passes 74 C# tests, six Python tests and four PicaVoxel cases; nine generic GPU readbacks pass under Unity CLI with Editor 6000.0.75f1 and D3D11. Full application rendering and resource-binding equivalence remain unverified.
+
+#13 is independent: serialized integer property bits must emit as ShaderLab `Integer`. It passes 59 C# tests and four PicaVoxel cases. #10 additionally fixes saturated moves and integer reads that fxc could fold away through float round trips. Its two new native regressions fail before the saturation fix; all 67 C# tests and four PicaVoxel cases pass afterward.
