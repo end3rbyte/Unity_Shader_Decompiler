@@ -81,7 +81,7 @@ class ShaderMetadata:
             subshaders.append({
                 "tags": self._tags(ss.get("m_Tags", {})),
                 "lod": ss.get("m_LOD"),
-                "passes": [self._pass(p, name_layouts) for p in raw_passes],
+                "passes": [self._pass(p, name_layouts, parsed.get("m_KeywordNames", [])) for p in raw_passes],
             })
         return subshaders
 
@@ -127,7 +127,7 @@ class ShaderMetadata:
                             variables.append(entry)
         return layouts
 
-    def _pass(self, p, name_layouts=None):
+    def _pass(self, p, name_layouts=None, keyword_names=()):
         state = p.get("m_State", {})
         prog_keys = ["m_ProgVertex", "m_ProgFragment", "m_ProgGeometry",
                      "m_ProgHull", "m_ProgDomain", "m_ProgRayTracing"]
@@ -154,11 +154,30 @@ class ShaderMetadata:
             "tags": self._tags(state.get("m_Tags", {})),
             "renderState": self._render_state(state),
             "programs": programs,
+            "directXPrograms": self._directx_programs(p, keyword_names),
             "constantBuffers": self._constant_buffers(p, prog_keys, index_to_name, name_layouts),
             "textures": p.get("m_SerializedProgram", {}).get("m_TextureParameters", []),
             "samplers": p.get("m_SerializedProgram", {}).get("m_SamplerParameters", []),
             "keywords": p.get("m_NameIndices", []),
         }
+
+    @staticmethod
+    def _directx_programs(shader_pass, keyword_names):
+        result = []
+        for stage in ("Vertex", "Fragment", "Geometry", "Hull", "Domain"):
+            program = shader_pass.get("m_Prog" + stage, {})
+            for group in program.get("m_PlayerSubPrograms", []):
+                for entry in group:
+                    if not 15 <= entry["m_GpuProgramType"] <= 22:
+                        continue
+                    indices = entry["m_KeywordIndices"]
+                    mask = program["m_SerializedKeywordStateMask"]
+                    if any(not 0 <= index < len(keyword_names) for index in indices + mask):
+                        raise ValueError("Shader variant references an invalid keyword index")
+                    result.append({"stage": stage, "blobIndex": entry["m_BlobIndex"],
+                                   "keywords": sorted(keyword_names[index] for index in indices),
+                                   "keywordMask": sorted(keyword_names[index] for index in mask)})
+        return result
 
     def _constant_buffers(self, p, prog_keys, index_to_name, name_layouts=None):
         # Unity serializes the constant-buffer layout (name + per-variable
