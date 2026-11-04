@@ -235,6 +235,7 @@ public static class HlslPrettyPrinter
         // Shares one name for variables at the same constant-buffer offset.
         Dictionary<string, string> cbufferRenames = BuildCbufferRenameMap(pass);
 
+        EnsureUniqueTextureNames(pass.Resources);
         PrintPassDeclarations(sb, pass, stripRegisterBindings, cbufferRenames);
         if (pass.VertexFunction is not null)
         {
