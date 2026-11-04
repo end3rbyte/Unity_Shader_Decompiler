@@ -21,7 +21,7 @@ Each branch carries its own generic regression tests and validation notes. All f
 
 Several emitter PRs regenerate the same golden file. After merging more than one, regenerate that reference from the combined emitter instead of choosing one branch's snapshot or editing shader text.
 
-`integration/review-validation` is the combined validation checkout, not another upstream PR. The obsolete aggregate branch was deleted. All review changes were merged from upstream, and the reference shader was regenerated through the combined emitter. Combined validation: 117 C# tests, 18 Python tests and all four PicaVoxel end-to-end cases pass. No new C# `var`, proprietary fixtures or local machine paths are included in the upstream PRs.
+The combined validation snapshot is published as the tag validation/compatibility-2026-11-04, not another upstream PR. The obsolete aggregate branch was deleted. All review changes were merged from upstream, and the reference shader was regenerated through the combined emitter. Initial combined validation: 117 C# tests, 18 Python tests and all four PicaVoxel end-to-end cases pass. No new C# `var`, proprietary fixtures or local machine paths are included in the upstream PRs.
 
 Two local shaders were independently exported with AssetStudioMod CLI v0.20.0 and AssetRipper from the same bundle. All four pipelines passed native compilation and deterministic DXBC execution comparison. Normalized metadata, decompressed blobs, generated shader/program files and serialized constant inputs match across exporters. The source JSON files and game data stay local.
 
@@ -42,3 +42,9 @@ The new native tests recompile with d3dcompiler and evaluate a restricted bit-co
 #13 is independent: serialized integer property bits must emit as ShaderLab `Integer`. It passes 59 C# tests and four PicaVoxel cases. #10 additionally fixes saturated moves and integer reads that fxc could fold away through float round trips. Its two new native regressions fail before the saturation fix; all 67 C# tests and four PicaVoxel cases pass afterward.
 
 Final local validation with the combined emitter: both external shaders retain four passes and 216 keyword combinations each. Unity CLI with Editor 6000.0.75f1 compiles all 864 stages; all four AssetStudio/AssetRipper pipelines pass 1,728 stage-instance execution comparisons. Generated shaders, program files, manifests and typed constant inputs match across exporters. Generic GPU selection checks pass nine readbacks. Test inputs now preserve integer property payloads and use bounded integer runtime probes from serialized parameter types; floating-point runtime values and resources remain synthetic. No proprietary fixtures are committed.
+
+## Compatibility follow-up
+
+The five updated PRs preserve CLI defaults and public entry points: #2 adds opt-in --fail-on-error; #3 retains all 35 legacy public fields with HasLegacyStatistics=false; #4 keeps the public recognition pass; #9 retains geometry/tessellation stages and the existing log-and-continue policy in expanded mode; #10 accepts default options and dynamic structured offsets while retaining old IR signatures and enum values. Strict export mode rejects invalid or unrecoverable data rather than guessing.
+
+Combined validation: 129 C# tests, 18 Python tests and four PicaVoxel cases pass. The default-mode geometry regression and structured-load compatibility tests fail before their fixes. Isolated suites pass 55 (#2), 54 (#3), 52 (#4), 78 (#9) and 72 (#10) C# tests, plus all four PicaVoxel cases each. Both external exporters reproduce the previously validated shader/program artifacts exactly; these compatibility changes do not constitute a new full-application GPU validation. No private fixtures or machine-specific paths are committed.
