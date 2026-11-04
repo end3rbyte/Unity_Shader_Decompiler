@@ -29,7 +29,7 @@ Two local shaders were independently exported with AssetStudioMod CLI v0.20.0 an
 
 - Restore constant-buffer `size` in #9 and protect both serialized-layout and binding-only paths with a Python serialization test. Repair comment encoding in #6 and #9.
 - In #7, native `mov`/`movc` round trips preserve exact signed/unsigned output words. All four new cases fail when raw bit preservation is disabled.
-- In #10, native structured-load round trips cover float, uint and int outputs, stride, offset and swizzle. The integer cases exposed float-to-integer conversions without #7; merge #7 before #10. Review #10's own changes against `fix/raw-register-semantics`.
+- In #10, native structured-load round trips cover float, uint and int outputs, stride, offset and swizzle. The integer cases exposed float-to-integer conversions without #7; merge #7 before #10. Review #10's own changes against `fix/raw-register-semantics`. Structured loads now reject fused mode explicitly and require `--no-fuse-temps`; the three native round trips also check this failure.
 - #2 still contains a production fix absent from upstream master; a local master's copy is not an upstream merge.
 
 Fresh isolated validation (Windows): #6 has 51 C# / 10 Python tests, #7 has 58 C# tests, #9 has 54 C# / 2 Python tests, and #10 including #7 has 65 C# tests. All four PicaVoxel cases pass in each checkout. Other follow-up changes only clarify PR descriptions; their previous validation remains recorded in their individual documents.
