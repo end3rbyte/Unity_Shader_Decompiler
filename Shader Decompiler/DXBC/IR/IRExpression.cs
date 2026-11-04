@@ -521,7 +521,6 @@ public abstract class IRExpression
         SampleCompare,
         SampleCompareLevelZero,
         Load,
-        LoadStructured,
         Gather,
         GatherCompare,
         Lod,
@@ -530,6 +529,7 @@ public abstract class IRExpression
         SamplePos,
         BufInfo,
         CheckAccessFullyMapped,
+        LoadStructured,
     }
 
     public sealed class TextureOperationExpression : IRExpression
