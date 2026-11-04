@@ -45,7 +45,7 @@ internal static class RegisterRoundTrip
     }
 
     // Deliberately limited to the bit-copy fixtures below; unexpected arithmetic fails.
-    internal static uint[] Evaluate(DxbcFile file, uint[] input)
+    internal static uint[] Evaluate(DxbcFile file, uint[] input, uint[]? structuredWords = null)
     {
         Dictionary<(RegisterType, uint), uint[]> registers = new Dictionary<(RegisterType, uint), uint[]>
         {
@@ -56,7 +56,7 @@ internal static class RegisterRoundTrip
             if (instruction.Opcode.ToString().StartsWith("Dcl", StringComparison.Ordinal)) continue;
             if (instruction.Opcode == Opcode.Ret) return registers[(RegisterType.Output, 0)];
             Assert.True(instruction.Opcode is Opcode.Mov or Opcode.MovC or Opcode.INe or Opcode.IEq
-                or Opcode.And, $"Unexpected opcode: {instruction.Opcode}");
+                or Opcode.And or Opcode.LdStructured, $"Unexpected opcode: {instruction.Opcode}");
             Operand destination = instruction.Operands[0];
             uint[] result = new uint[4];
             for (int lane = 0; lane < 4; lane++)
@@ -66,6 +66,18 @@ internal static class RegisterRoundTrip
                 if (instruction.Opcode == Opcode.Mov) result[lane] = first;
                 else if (instruction.Opcode == Opcode.MovC)
                     result[lane] = Read(instruction.Operands[first != 0 ? 2 : 3], lane, registers);
+                else if (instruction.Opcode == Opcode.LdStructured)
+                {
+                    Assert.NotNull(structuredWords);
+                    Operand resource = instruction.Operands[3];
+                    Instruction declaration = Assert.Single(file.Shader.Instructions,
+                        item => item.Opcode == Opcode.DclResourceStructured
+                            && item.Operands[0].RegisterIndex == resource.RegisterIndex);
+                    uint stride = declaration.ExtraData.Single();
+                    uint offset = Read(instruction.Operands[2], lane, registers);
+                    Assert.Equal(0u, offset % 4);
+                    result[lane] = structuredWords[checked((int)((first * stride + offset) / 4)) + Component(resource, lane)];
+                }
                 else
                 {
                     uint second = Read(instruction.Operands[2], lane, registers);
