@@ -413,6 +413,10 @@ If you change the pretty printer or surface-shader recognition, keep
 - The reverse-engineering notes in `docs/` document the UnityShaderCompiler work
   this project is built on.
 
+## VolumetricLights regression corpus
+
+The [VolumetricLights fixtures](tests/Fixtures/VolumetricLights/README.md) add three BSD-licensed shaders compiled with Unity 6000.0.75f1 / D3D11. Run `python tests/e2e/test_volumetric_lights.py` after building the Release CLI. It checks all 199 expected DirectX programs and requires [PR #6](https://github.com/Abby1591/Unity_Shader_Decompiler/pull/6): the three shader cases fail before that schema fix and pass afterward. It does not claim generated-HLSL compilation or rendering equivalence.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
