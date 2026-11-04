@@ -210,7 +210,7 @@ public static class SpecTestVectors
     // ---- SFI0 (shader feature flags) ----
     private static void TestSfi0()
     {
-        var dxbc = DxbcWithChunk("SFI0", Sfi0ChunkBytes(2UL));
+        byte[] dxbc = DxbcWithChunk("SFI0", Sfi0ChunkBytes(2UL));
         var file = new DxbcFile();
         file.Load(dxbc);
 

@@ -227,7 +227,7 @@ public class BlobAndDxbcTests
     [Fact]
     public void Sfi0Chunk_RejectsInvalidLength()
     {
-        var dxbc = SpecBlobs.DxbcWithChunk("SFI0", new byte[4]);
+        byte[] dxbc = SpecBlobs.DxbcWithChunk("SFI0", new byte[4]);
         Assert.Throws<InvalidDataException>(() => new DxbcFile().Load(dxbc));
     }
 

@@ -221,7 +221,7 @@ public static class Decompiler
                     log.WriteLine($"Saved: {dxbcPath}");
                 }
 
-                IRPipeline.Result pipelineResult = IRPipeline.Run(dxbcFile, options.DumpStages);
+                IRPipeline.Result pipelineResult = IRPipeline.Run(dxbcFile, options.DumpStages, preserveArithmetic: !options.FuseTemps);
 
                 if (options.DumpStages)
                 {
@@ -314,6 +314,7 @@ public static class Decompiler
                 }
                 else
                 {
+                    function.RawTemporaryStorage = !options.FuseTemps;
                     candidates.Add(new DecompiledSubprogram
                     {
                         Index = i,
@@ -484,6 +485,12 @@ public static class Decompiler
             if (prop.Kind == HlslPropertyKind.Texture)
                 textureNames[texSlot++] = prop.Name;
 
+        if (allPasses.Any(p => p.DirectXPrograms.Count != 0))
+        {
+            BuildSerializedVariantPasses(astShader, allPasses, candidates, textureNames, log);
+            return;
+        }
+
         foreach (DecompiledSubprogram c in candidates)
             c.Hash = Convert.ToHexString(SHA256.HashData(c.DxbcBytes));
 
@@ -595,6 +602,43 @@ public static class Decompiler
         log.WriteLine($"BuildVariantPasses: {groups.Count} pass group(s), {totalPasses} pass(es) emitted total.");
     }
 
+    private static void BuildSerializedVariantPasses(
+        HlslShaderNode shader, List<HlslPassNode> shells, List<DecompiledSubprogram> candidates,
+        Dictionary<uint, string> textureNames, TextWriter log)
+    {
+        Dictionary<int, DecompiledSubprogram> byIndex = candidates.ToDictionary(c => c.Index);
+        HashSet<int> covered = new HashSet<int>();
+        foreach (HlslPassNode shell in shells)
+        {
+            if (shell.DirectXPrograms.Count == 0) continue;
+            List<(int Vertex, int Fragment)> pairs = VariantPairing.Pair(shell.DirectXPrograms);
+            HlslSubShaderNode parent = shader.SubShaders.Single(ss => ss.Passes.Contains(shell));
+            int insertAt = parent.Passes.IndexOf(shell);
+            foreach ((int vertexIndex, int fragmentIndex) in pairs)
+            {
+                if (!byIndex.TryGetValue(vertexIndex, out DecompiledSubprogram? vertex) ||
+                    !byIndex.TryGetValue(fragmentIndex, out DecompiledSubprogram? fragment))
+                    throw new InvalidDataException("Serialized variant references a missing DXBC program.");
+                if (vertex.Stage != HlslShaderStage.Vertex || fragment.Stage != HlslShaderStage.Fragment)
+                    throw new InvalidDataException("Serialized variant stage does not match its DXBC program.");
+                string[] inputs = fragment.InputInterpolators.Split(';', StringSplitOptions.RemoveEmptyEntries);
+                string[] outputs = vertex.OutputInterpolators.Split(';', StringSplitOptions.RemoveEmptyEntries);
+                if (!inputs.All(outputs.Contains))
+                    throw new InvalidDataException($"Variant {vertexIndex}/{fragmentIndex} has incompatible interpolators.");
+                HlslPassNode pass = insertAt == parent.Passes.IndexOf(shell) ? shell : ClonePass(shell);
+                if (!ReferenceEquals(pass, shell)) parent.Passes.Insert(insertAt, pass);
+                AttachPassProgram(pass, vertex, textureNames, log);
+                AttachPassProgram(pass, fragment, textureNames, log);
+                covered.Add(vertexIndex);
+                covered.Add(fragmentIndex);
+                insertAt++;
+            }
+            log.WriteLine($"Serialized variants: {pairs.Count} stage pairs.");
+        }
+        if (byIndex.Keys.Except(covered).Any())
+            throw new InvalidDataException("DXBC programs are missing from serialized variant coverage.");
+    }
+
     // Attaches one candidate's function, resources and structs to a pass,
     // unioning cbuffer members the way the previous streaming loop did.
     private static void AttachPassProgram(
@@ -618,10 +662,9 @@ public static class Decompiler
             // Cbuffers merge by slot: vert and frag subprograms of the same
             // pass touch the same constant-buffer slots, so union the
             // members (keeping the largest array size for any fallback).
+            // Equal names do not make resources at different bindings identical.
             HlslResourceNode? existing = pass.Resources.FirstOrDefault(r =>
-                r.Kind == res.Kind && (res.Kind == HlslResourceKind.ConstantBuffer
-                    ? r.Slot == res.Slot
-                    : r.Slot == res.Slot || r.Name == res.Name));
+                r.Kind == res.Kind && r.Slot == res.Slot);
 
             if (existing is null)
             {
@@ -655,6 +698,35 @@ public static class Decompiler
                         existing.Variables.Add(v);
                     }
                 }
+            }
+        }
+
+        // A fallback array is shared by all stages in the emitted HLSL pass.
+        // Once present, every stage reads raw slots, including stages whose
+        // reads were resolved to named metadata members before the merge.
+        foreach (HlslResourceNode buffer in pass.Resources.Where(r => r.Kind == HlslResourceKind.ConstantBuffer))
+        {
+            HlslCBufferVariable? raw = buffer.Variables.FirstOrDefault(
+                v => v.Name == $"cb{buffer.Slot}_values" && v.ArraySize is not null);
+            if (raw is null)
+                continue;
+            int metadataRegisters = pass.Cbuffers
+                .Where(entry => entry.Key.Slot == (int)buffer.Slot)
+                .Select(entry => (entry.Value.Size + 15) / 16)
+                .DefaultIfEmpty(0)
+                .Max();
+            int count = Math.Max(raw.ArraySize!.Value, metadataRegisters);
+            if (count > raw.ArraySize.Value)
+            {
+                buffer.Variables.Remove(raw);
+                buffer.Variables.Add(new HlslCBufferVariable
+                {
+                    Name = raw.Name,
+                    TypeName = raw.TypeName,
+                    Offset = raw.Offset,
+                    Size = (uint)count * 16,
+                    ArraySize = count,
+                });
             }
         }
 

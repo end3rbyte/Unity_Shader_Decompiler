@@ -164,6 +164,7 @@ public sealed class SubShaderMetadata
 
 public sealed class PassMetadata
 {
+    public List<ProgramVariantMetadata> DirectXPrograms { get; } = new();
     public string Name { get; init; } = "";
     public Dictionary<string, string> Tags { get; init; } = new();
     public JsonElement RenderState { get; init; }
@@ -189,14 +190,25 @@ public sealed class PassMetadata
             foreach (var cb in cbs.EnumerateArray())
                 result.ConstantBuffers.Add(CbufferMetadata.From(cb));
 
+        if (el.TryGetProperty("directXPrograms", out JsonElement programs))
+            foreach (JsonElement program in programs.EnumerateArray())
+                result.DirectXPrograms.Add(new ProgramVariantMetadata(
+                    program.GetProperty("blobIndex").GetInt32(),
+                    program.GetProperty("stage").GetString()!,
+                    program.GetProperty("keywords").EnumerateArray().Select(k => k.GetString()!).ToArray(),
+                    program.GetProperty("keywordMask").EnumerateArray().Select(k => k.GetString()!).ToArray()));
+
         return result;
     }
 }
+
+public sealed record ProgramVariantMetadata(int BlobIndex, string Stage, string[] Keywords, string[] KeywordMask);
 
 /// <summary>One cbuffer in a pass: register slot -> name + variables.</summary>
 public sealed class CbufferMetadata
 {
     public int Slot { get; init; } = -1;
+    public int Size { get; init; }
     // Stage this buffer is bound in (Vertex/Fragment/Geometry/...). Stages
     // bind their own cbuffer tables, so two different buffers can legally
     // share a slot number across stages (e.g. UnityPerDraw and $Globals
@@ -212,6 +224,9 @@ public sealed class CbufferMetadata
             Slot = el.TryGetProperty("slot", out var s) && s.ValueKind == JsonValueKind.Number
                 ? s.GetInt32()
                 : -1,
+            Size = el.TryGetProperty("size", out JsonElement size) && size.ValueKind == JsonValueKind.Number
+                ? size.GetInt32()
+                : 0,
             Stage = el.TryGetProperty("stage", out var st) && st.ValueKind == JsonValueKind.String
                 ? st.GetString() ?? ""
                 : "",
