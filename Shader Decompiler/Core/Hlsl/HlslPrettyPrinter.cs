@@ -584,9 +584,9 @@ public static class HlslPrettyPrinter
         // used to render RDEF-less cbN[slot] reads as real variable names.
         public Dictionary<int, CbufferMetadata> Cbuffers { get; set; } = new();
 
-        public HashSet<int> RawCbufferSlots { get; } = new();
         public bool PreserveArithmetic { get; init; }
         public bool RawTemporaryStorage { get; init; }
+        public HashSet<int> RawCbufferSlots { get; } = new();
 
         // Identifier each defining instruction actually declared for a
         // value, keyed by the value's structural identity (storage location
