@@ -149,6 +149,7 @@ directory and then one level up.
 | --- | --- |
 | `--out-root <dir>` | Write the `.shader` and subprogram artifacts to `<dir>` |
 | `--dump-stages` | Print the IR after every pipeline phase |
+| `--no-fuse-temps` | Preserve raw register bits and arithmetic order; disable temporary fusion |
 | `--save-subprograms` | Write per-subprogram `.bin`, `.dxbc`, and disassembly files |
 | `--no-surface-shaders` | Emit raw HLSLPROGRAM passes instead of surface-shader form |
 | `--keep-passes` | Keep original passes as comments when a surface shader is recognized |
@@ -181,7 +182,7 @@ and spaces are stripped).
 | `--dump-keywords` | Print each subprogram's global and local keyword sets |
 | `--fail-on-error` | Stop with a non-zero exit code on subprogram errors, invalid SSA, missing input, or a pass group with no renderable variant (default: off) |
 | `--save-subprograms` | Also write per-subprogram `program{i}.bin`, `program{i}.dxbc`, and `program{i}.hlsl` (disassembly) |
-| `--no-fuse-temps` | Disable temp fusion; keep every SSA copy as a separate statement |
+| `--no-fuse-temps` | Keep raw uint temporary storage with typed reads and outputs; disable temporary fusion and arithmetic rewrites |
 | `--no-surface-shaders` | Disable surface-shader recognition; emit raw reconstructed HLSLPROGRAM passes |
 | `--keep-passes` | When a pass is recognized as a surface shader, keep the original compiled passes as comments |
 | `--keep-register-bindings` | Keep explicit `register(tN)` / `register(bN)` bindings (stripped by default) |
@@ -331,7 +332,16 @@ root, prefixing each with
 
 ## Limitations
 
+With `--no-fuse-temps`, saturated moves clamp floating-point values before
+storing raw bits. Integer reads remain in integer storage, preserving low-bit
+conditions that fxc can otherwise fold away through a float round trip.
+
 - Targets Unity 2022.3 D3D11 shader blobs.
+- Structured-buffer loads work with the default options and `--no-fuse-temps`.
+  Their functions automatically retain raw register storage and skip unsafe
+  temporary fusion. Strides, constant/dynamic byte offsets and swizzles are
+  preserved; invalid constant offsets fail explicitly. Existing public IR
+  entry points and texture-operation enum values are retained.
 - Vertex and fragment stages are fully reconstructed. Hull, geometry, domain,
   and compute programs are parsed and IR-built, but the AST/emit path mainly
   targets vertex/fragment; other stages attach by serialization order.

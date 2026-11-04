@@ -318,6 +318,9 @@ public abstract class IRExpression
                 IRIntrinsic.CastUInt  => IRValueType.UInt,
                 IRIntrinsic.CastDouble => IRValueType.Double,
                 IRIntrinsic.CastBool  => IRValueType.Bool,
+                IRIntrinsic.AsFloat => IRValueType.Float,
+                IRIntrinsic.AsInt => IRValueType.Int,
+                IRIntrinsic.AsUInt => IRValueType.UInt,
 
                 IRIntrinsic.Any => IRValueType.Bool,
                 IRIntrinsic.All => IRValueType.Bool,
@@ -526,6 +529,7 @@ public abstract class IRExpression
         SamplePos,
         BufInfo,
         CheckAccessFullyMapped,
+        LoadStructured,
     }
 
     public sealed class TextureOperationExpression : IRExpression
@@ -539,6 +543,10 @@ public abstract class IRExpression
         public IRExpression? Coordinates { get; init; }
 
         public IRExpression? Offset { get; init; }
+
+        public uint StructuredStride { get; init; }
+
+        public byte DestinationMask { get; init; }
 
         public IRExpression? LOD { get; init; }
 
