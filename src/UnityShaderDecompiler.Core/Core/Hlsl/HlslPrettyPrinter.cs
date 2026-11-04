@@ -1694,7 +1694,12 @@ public static class HlslPrettyPrinter
             return textureName;
         }
         if (reg.SymbolicName is not null)
-            return reg.SymbolicName;
+            return reg.RegisterType switch
+            {
+                RegisterType.Temp => $"{reg.SymbolicName}_r{reg.Index}",
+                RegisterType.IndexableTemp => $"{reg.SymbolicName}_x{reg.Index}",
+                _ => reg.SymbolicName,
+            };
 
         return reg.RegisterType switch
         {
