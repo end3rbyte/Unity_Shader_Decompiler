@@ -241,6 +241,7 @@ Each subprogram goes through `IRPipeline` (`DXBC/IR/IRPipeline.cs`):
    iterations.
 8. **Pattern recognition** — fold shader idioms back into high-level IR with
    the matrix, vector, texture, loop, and shader-pattern recognizers.
+   Explicit texture LODs, including zero, remain explicit in emitted HLSL.
 9. **Leave SSA** — eliminate phis and coalesce copies. Copies follow their
    conditional join; branch-written values remain in scope for subsequent reads.
 10. **Metadata binding** — attach RDEF/ISGN/OSGN symbolic names to the IR.
