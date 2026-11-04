@@ -17,6 +17,7 @@
 
     <ItemGroup>
         <InternalsVisibleTo Include="UnityShaderDecompiler.Tests" />
+        <InternalsVisibleTo Include="Shader Decompiler" />
     </ItemGroup>
 
 </Project>

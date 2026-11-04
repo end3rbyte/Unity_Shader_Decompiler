@@ -163,6 +163,7 @@ internal class Program
             DumpKeywords = args.Contains("--dump-keywords"),
             FailOnError = failOnError,
             SaveSubprograms = args.Contains("--save-subprograms"),
+            RestoreKeywordVariants = args.Contains("--restore-keyword-variants"),
             FuseTemps = !args.Contains("--no-fuse-temps"),
             ReconstructSurfaceShaders = !args.Contains("--no-surface-shaders"),
             KeepPasses = args.Contains("--keep-passes"),
@@ -227,6 +228,7 @@ internal class Program
             {
                 OutRoot = outRoot,
                 FailOnError = args.Contains("--fail-on-error"),
+                RestoreKeywordVariants = args.Contains("--restore-keyword-variants"),
                 FuseTemps = !args.Contains("--no-fuse-temps"),
                 ReconstructSurfaceShaders = !args.Contains("--no-surface-shaders"),
                 KeepPasses = args.Contains("--keep-passes"),

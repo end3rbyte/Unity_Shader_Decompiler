@@ -168,58 +168,84 @@ public static class HlslPrettyPrinter
         PrintTags(sb, pass.Tags, indent: "            ");
         PrintRenderState(sb, pass.State);
 
-        // Empty pass (no decompiled functions) — emit a valid stub so
-        // pass indices stay stable for Graphics.Blit(material, passIndex).
-        bool hasAnyFunction = pass.VertexFunction is not null || pass.FragmentFunction is not null
-            || pass.GeometryFunction is not null || pass.HullFunction is not null
-            || pass.DomainFunction is not null || pass.ComputeFunction is not null;
-
         sb.Append("            HLSLPROGRAM\n");
-
-        if (!hasAnyFunction)
+        if (pass.RuntimeVariants is RuntimeVariantPlan plan)
         {
-            sb.AppendLine("            #pragma vertex vert");
-            sb.AppendLine("            #pragma fragment frag");
-            sb.AppendLine("            cbuffer _StubCB : register(b1) { float4x4 unity_MatrixVP; };");
-            sb.AppendLine("            struct v2f { float4 pos : SV_POSITION; };");
-            sb.AppendLine("            v2f vert(float4 v : POSITION) { v2f o; o.pos = mul(unity_MatrixVP, v); return o; }");
-            sb.AppendLine("            float4 frag(v2f i) : SV_Target { return 0; }");
+            sb.Append("            #pragma only_renderers d3d11\n");
+            sb.Append($"            #pragma target {pass.ShaderTarget}\n");
+            sb.Append("            #pragma vertex vert\n");
+            sb.Append("            #pragma fragment frag\n");
+            foreach (RuntimeKeywordGroup group in plan.Groups)
+            {
+                string directive = group.Local ? "multi_compile_local" : "multi_compile";
+                string choices = (group.AllowsDisabled ? "__ " : "") + string.Join(" ", group.Keywords);
+                sb.Append($"            #pragma {directive} {choices}\n");
+            }
+            foreach (string keyword in plan.StrippedKeywords)
+            {
+                string directive = plan.LocalKeywords.Contains(keyword) ? "multi_compile_local" : "multi_compile";
+                sb.Append($"            #pragma {directive} __ {keyword}\n");
+                sb.Append($"            #pragma skip_variants {keyword}\n");
+            }
+            for (int index = 0; index < plan.States.Count; index++)
+            {
+                HashSet<string> enabled = plan.States[index].Keywords.ToHashSet(StringComparer.Ordinal);
+                string condition = string.Join(" && ", plan.Mask.Select(keyword =>
+                    (enabled.Contains(keyword) ? "" : "!") + $"defined({keyword})"));
+                if (condition.Length == 0) {
+                    condition = "1";
+                }
+                sb.Append($"            #{(index == 0 ? "if" : "elif")} {condition}\n");
+                PrintPassProgram(sb, pass.VariantPrograms[index], fuseTemps, stripRegisterBindings, false);
+            }
+            sb.Append("            #else\n");
+            sb.Append("            #error No serialized program matches this shader keyword state\n");
+            sb.Append("            #endif\n");
         }
+        else
+        {
+            PrintPassProgram(sb, pass, fuseTemps, stripRegisterBindings, true);
+        }
+        sb.Append("            ENDHLSL\n");
+        sb.Append("        }\n");
+    }
 
-        // Interpolator hand-off map: the vertex stage records which semantic
-        // fields carry named values (worldPos, worldNormal, ...) so the
-        // fragment stage can seed the matching input registers.
-        var stageInterpolators = new Dictionary<string, string>();
+    // Emits resource declarations and functions for one shader pass.
+    private static void PrintPassProgram(StringBuilder sb, HlslPassNode pass, bool fuseTemps,
+        bool stripRegisterBindings, bool entryPragmas)
+    {
+        PrintEmptyPassStub(sb, pass);
+        // Carries semantic names from vertex outputs to fragment inputs.
+        Dictionary<string, string> stageInterpolators = new Dictionary<string, string>();
 
-        // Build cross-stage cbuffer variable rename mapping: when vert and
-        // frag have different variables at the same byte offset within a
-        // merged cbuffer, one variable is declared and the other's references
-        // in the function body are redirected.
-        var cbufferRenames = BuildCbufferRenameMap(pass);
+        // Shares one name for variables at the same constant-buffer offset.
+        Dictionary<string, string> cbufferRenames = BuildCbufferRenameMap(pass);
 
-        EnsureUniqueTextureNames(pass.Resources);
-        foreach (HlslResourceNode res in pass.Resources)
-            PrintResource(sb, res, stripRegisterBindings, cbufferRenames);
-
-        foreach (HlslStructNode s in pass.Structs)
-            PrintStruct(sb, s);
-
+        PrintPassDeclarations(sb, pass, stripRegisterBindings, cbufferRenames);
         if (pass.VertexFunction is not null)
         {
-            sb.Append("            #pragma vertex vert\n");
+            if (entryPragmas)
+            {
+                sb.Append("            #pragma vertex vert\n");
+            }
             PrintFunction(sb, pass.VertexFunction, pass.Cbuffers, fuseTemps, stageOutputs: stageInterpolators, resources: pass.Resources, cbufferRenames: cbufferRenames);
         }
         if (pass.FragmentFunction is not null)
         {
-            sb.Append("            #pragma fragment frag\n");
+            if (entryPragmas)
+            {
+                sb.Append("            #pragma fragment frag\n");
+            }
             PrintFunction(sb, pass.FragmentFunction, pass.Cbuffers, fuseTemps, stageInputs: stageInterpolators, resources: pass.Resources, cbufferRenames: cbufferRenames);
         }
         foreach (HlslFunctionNode? f in new[] { pass.GeometryFunction, pass.HullFunction, pass.DomainFunction, pass.ComputeFunction })
+        {
             if (f is not null)
+            {
                 PrintFunction(sb, f, pass.Cbuffers, fuseTemps, resources: pass.Resources, cbufferRenames: cbufferRenames);
+            }
+        }
 
-        sb.Append("            ENDHLSL\n");
-        sb.Append("        }\n");
     }
 
     private static void PrintRenderState(StringBuilder sb, HlslRenderState s)
@@ -2820,5 +2846,39 @@ public static class HlslPrettyPrinter
             _ =>
                 $"/* TODO: no confirmed HLSL mapping for {tex.Operation} */ {resource}.{tex.Operation}({Args(sampler, coord)})",
         };
+    }
+
+    // Emits a valid stub when a pass contains no decompiled functions.
+    private static void PrintEmptyPassStub(StringBuilder sb, HlslPassNode pass)
+    {
+        // Empty pass (no decompiled functions) — emit a valid stub so
+        // pass indices stay stable for Graphics.Blit(material, passIndex).
+        bool hasAnyFunction = pass.VertexFunction is not null || pass.FragmentFunction is not null
+            || pass.GeometryFunction is not null || pass.HullFunction is not null
+            || pass.DomainFunction is not null || pass.ComputeFunction is not null;
+
+        if (!hasAnyFunction)
+        {
+            sb.AppendLine("            #pragma vertex vert");
+            sb.AppendLine("            #pragma fragment frag");
+            sb.AppendLine("            cbuffer _StubCB : register(b1) { float4x4 unity_MatrixVP; };");
+            sb.AppendLine("            struct v2f { float4 pos : SV_POSITION; };");
+            sb.AppendLine("            v2f vert(float4 v : POSITION) { v2f o; o.pos = mul(unity_MatrixVP, v); return o; }");
+            sb.AppendLine("            float4 frag(v2f i) : SV_Target { return 0; }");
+        }
+    }
+
+    // Prints the resources and interpolator structures shared by a pass.
+    private static void PrintPassDeclarations(StringBuilder sb, HlslPassNode pass, bool stripRegisterBindings, Dictionary<string, string> cbufferRenames)
+    {
+        foreach (HlslResourceNode res in pass.Resources)
+        {
+            PrintResource(sb, res, stripRegisterBindings, cbufferRenames);
+        }
+
+        foreach (HlslStructNode s in pass.Structs)
+        {
+            PrintStruct(sb, s);
+        }
     }
 }

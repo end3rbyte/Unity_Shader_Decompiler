@@ -251,10 +251,11 @@ Each subprogram goes through `IRPipeline` (`DXBC/IR/IRPipeline.cs`):
     storage preserves the serialized extent and starts at byte zero.
 11. **AST build** — one function node per subprogram; the
     Shader/SubShader/Pass shell comes from `metadata.json`.
-12. **Pass and variant recovery** — `BuildVariantPasses` groups subprograms
-    into passes. Unity serializes them pass-by-pass, so a stage regression
-    marks a pass boundary. Vertex and fragment variants are paired by
-    interpolator hand-off signature, and byte-identical pairs are deduplicated.
+12. **Pass and variant recovery** — use serialized program references when
+    available, pairing stages whose enabled keywords agree within their shared
+    keyword masks, including Geometry/Hull/Domain in expanded passes. Validate
+    stage interfaces; older metadata falls back to
+    serialization order and signatures. Byte-identical pairs are deduplicated.
 13. **Pretty print** — emit properties, tags, LOD, render state,
     `HLSLPROGRAM` blocks, structs, resources, and function bodies. Numeric literals
     use a decimal point regardless of system locale (for example, `0.5`, not `0,5`).
@@ -334,6 +335,14 @@ root, prefixing each with
 - Vertex and fragment stages are fully reconstructed. Hull, geometry, domain,
   and compute programs are parsed and IR-built, but the AST/emit path mainly
   targets vertex/fragment; other stages attach by serialization order.
+- By default, compatible keyword variants are emitted as separate passes.
+  `--restore-keyword-variants` keeps the original passes and restores D3D11
+  keyword selection for complete, unambiguous vertex/fragment variant sets.
+  It requires serialized program references and keyword scope flags; missing,
+  correlated or unsupported states fail explicitly. Surface rewrites are disabled
+  in this mode. The adjacent `.variants.json` lets `--recompile-verify` compile
+  every recovered combination and rejects stale shader/manifest pairs.
+  [Unity GPU checks](tests/UnityRuntime/README.md) target **6000.0.75f1**.
 - Surface-shader rewrites are gated on recompiled signature matches. Passes
   that do not match are emitted as HLSLPROGRAM.
 - Passes declared in metadata with no compiled DX11 variants in the blob are
