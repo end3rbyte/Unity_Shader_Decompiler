@@ -245,6 +245,7 @@ Each subprogram goes through `IRPipeline` (`DXBC/IR/IRPipeline.cs`):
 10. **Metadata binding** — attach RDEF/ISGN/OSGN symbolic names to the IR.
     Same-named resources keep distinct binding slots; raw constant-buffer fallback
     storage preserves the serialized extent and starts at byte zero.
+    Temporary names retain register identity to avoid collisions.
 11. **AST build** — one function node per subprogram; the
     Shader/SubShader/Pass shell comes from `metadata.json`.
 12. **Pass and variant recovery** — `BuildVariantPasses` groups subprograms
