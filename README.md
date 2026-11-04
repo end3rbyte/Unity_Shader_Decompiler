@@ -333,6 +333,10 @@ Serialized integer properties (type 5) emit as ShaderLab `Integer`, preserving
 the integer bits stored in the float default slot. Non-finite JSON defaults are
 rejected because their original integer payload cannot be recovered reliably.
 
+With `--no-fuse-temps`, saturated moves clamp floating-point values before
+storing raw bits. Integer reads remain in integer storage, preserving low-bit
+conditions that fxc can otherwise fold away through a float round trip.
+
 - Targets Unity 2022.3 D3D11 shader blobs.
 - Structured-buffer loads require `--no-fuse-temps`. Element stride, constant
   byte offsets and swizzles are preserved; fused mode, dynamic offsets and
