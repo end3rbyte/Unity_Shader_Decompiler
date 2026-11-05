@@ -346,6 +346,7 @@ class ShaderMetadata:
         rs = {
             "cull": self._unwrap(state.get("m_Culling")),
             "zTest": self._unwrap(state.get("m_ZTest")),
+            "zTestName": self._state_name(state.get("m_ZTest")),
             "zWrite": self._unwrap(state.get("m_ZWrite")),
             "zClip": self._unwrap(state.get("m_ZClip"), 1),
             "lighting": state.get("m_Lighting"),
@@ -377,6 +378,13 @@ class ShaderMetadata:
                 "blend": old_blend if isinstance(old_blend, dict) else blend,
             })
         return rs
+
+    # Preserves a serialized ShaderLab property reference in a render state.
+    def _state_name(self, value):
+        if not isinstance(value, dict):
+            return None
+        name = value.get("m_Name")
+        return name if isinstance(name, str) and name not in ("", "<noninit>") else None
 
     @staticmethod
     def _named(x):

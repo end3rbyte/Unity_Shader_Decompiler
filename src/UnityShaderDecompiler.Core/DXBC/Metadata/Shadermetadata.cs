@@ -193,10 +193,10 @@ public sealed class PassMetadata
 
     public static PassMetadata From(JsonElement el)
     {
-        if (el.TryGetProperty("programParameters", out JsonElement _))
-        {
-            throw new InvalidDataException("Per-program shader parameters require HLSL binding support before decompilation.");
-        }
+        JsonElement parameterRecords = el.TryGetProperty("programParameters", out JsonElement records)
+            ? records : default;
+        if (parameterRecords.ValueKind != JsonValueKind.Undefined && parameterRecords.ValueKind != JsonValueKind.Array)
+            throw new InvalidDataException("Invalid per-program shader parameter list.");
         var result = new PassMetadata
         {
             Name = el.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "",
@@ -213,17 +213,36 @@ public sealed class PassMetadata
 
         if (el.TryGetProperty("directXPrograms", out JsonElement programs))
             {
+            if (parameterRecords.ValueKind == JsonValueKind.Array && parameterRecords.GetArrayLength() != programs.GetArrayLength())
+                throw new InvalidDataException("Serialized program and parameter counts differ.");
+            int recordIndex = 0;
             foreach (JsonElement program in programs.EnumerateArray())
                 {
+                JsonElement? parameters = parameterRecords.ValueKind == JsonValueKind.Array
+                    ? parameterRecords[recordIndex++] : null;
+                if (parameters is JsonElement parameter &&
+                    (parameter.GetProperty("blobIndex").GetInt32() != program.GetProperty("blobIndex").GetInt32()
+                     || parameter.GetProperty("stage").GetString() != program.GetProperty("stage").GetString()
+                     || !SameKeywords(parameter, program, "keywords")
+                     || !SameKeywords(parameter, program, "keywordMask")))
+                    throw new InvalidDataException("Serialized program parameter reference does not match its code reference.");
                 result.DirectXPrograms.Add(new ProgramVariantMetadata(
                     program.GetProperty("blobIndex").GetInt32(),
                     program.GetProperty("stage").GetString()!,
                     program.GetProperty("keywords").EnumerateArray().Select(k => k.GetString()!).ToArray(),
-                    program.GetProperty("keywordMask").EnumerateArray().Select(k => k.GetString()!).ToArray()));
+                    program.GetProperty("keywordMask").EnumerateArray().Select(k => k.GetString()!).ToArray(), parameters));
             }
         }
 
         return result;
+    }
+
+    // Verifies that a parameter record belongs to the referenced keyword variant.
+    private static bool SameKeywords(JsonElement parameters, JsonElement program, string field)
+    {
+        string[] left = parameters.GetProperty(field).EnumerateArray().Select(item => item.GetString()!).Order().ToArray();
+        string[] right = program.GetProperty(field).EnumerateArray().Select(item => item.GetString()!).Order().ToArray();
+        return left.SequenceEqual(right);
     }
 }
 
@@ -275,6 +294,7 @@ public sealed class CbufferVariableMetadata
     public int RowCount { get; init; }   // 4 for float4x4 (matrices)
     public int ArraySize { get; init; }
     public bool IsMatrix { get; init; }
+    public string BaseType { get; init; } = "float";
 
     public int Rows => Math.Max(RowCount, 4);
 
@@ -285,13 +305,13 @@ public sealed class CbufferVariableMetadata
         : Math.Max(1, Dim) * 4 * Math.Max(1, ArraySize);
 
     public string TypeName => (IsMatrix || RowCount > 0)
-        ? (Rows == 4 ? "float4x4" : $"float{Rows}x4")
+        ? (Rows == 4 ? $"{BaseType}4x4" : $"{BaseType}{Rows}x4")
         : (Math.Max(1, Dim) switch
         {
-            1 => "float",
-            2 => "float2",
-            3 => "float3",
-            _ => "float4",
+            1 => BaseType,
+            2 => $"{BaseType}2",
+            3 => $"{BaseType}3",
+            _ => $"{BaseType}4",
         });
 
     public static CbufferVariableMetadata From(JsonElement el) => new()

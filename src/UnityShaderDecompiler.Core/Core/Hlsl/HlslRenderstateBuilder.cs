@@ -22,6 +22,8 @@ public static class HlslRenderStateBuilder
         {
             Cull = EnumOr(renderState, "cull", HlslCullMode.Back),
             ZTest = EnumOr(renderState, "zTest", HlslCompareFunction.LessEqual),
+            ZTestName = renderState.TryGetProperty("zTestName", out JsonElement zTestName)
+                && zTestName.ValueKind == JsonValueKind.String ? zTestName.GetString() : null,
             ZWrite = BoolOr(renderState, "zWrite", true),
             ZClip = BoolOr(renderState, "zClip", true),
             Lighting = BoolOr(renderState, "lighting", false),

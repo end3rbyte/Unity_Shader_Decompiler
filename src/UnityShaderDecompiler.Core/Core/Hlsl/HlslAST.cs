@@ -153,6 +153,7 @@ public sealed class HlslRenderState
 {
     public HlslCullMode Cull { get; init; } = HlslCullMode.Back;
     public HlslCompareFunction ZTest { get; init; } = HlslCompareFunction.LessEqual;
+    public string? ZTestName { get; init; }
     public bool ZWrite { get; init; } = true;
     public bool ZClip { get; init; } = true;
     public bool Lighting { get; init; }
@@ -199,6 +200,7 @@ public sealed class HlslPassNode
     public HlslFunctionNode? ComputeFunction { get; set; }
 
     public List<HlslResourceNode> Resources { get; } = new();
+    public bool UseStageBindings { get; set; }
     public List<HlslStructNode> Structs { get; } = new();
 
     // Cbuffer layout recovered from the ShaderLab metadata (per-pass

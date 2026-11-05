@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
+using System.Text.Json;
 using AssetStudio;
 using UnityShaderDecompiler.Core.Hlsl.Ast;
 using UnityShaderDecompiler.Core.Hlsl;
@@ -713,9 +714,22 @@ public static class Decompiler
         HlslPassNode pass,
         DecompiledSubprogram c,
         Dictionary<uint, string>? textureNames,
-        TextWriter log)
+        TextWriter log,
+        ProgramVariantMetadata? reference = null)
     {
         AttachFunction(pass, c.Function);
+
+        SerializedProgramBindings? bindings = reference?.Parameters is JsonElement serialized
+            ? SerializedProgramBindings.Parse(serialized) : null;
+        if (bindings is not null)
+        {
+            pass.UseStageBindings = true;
+            foreach (CbufferMetadata buffer in bindings.ConstantBuffers)
+            {
+                if (!pass.Cbuffers.TryAdd((buffer.Slot, buffer.Stage), buffer))
+                    throw new InvalidDataException($"Conflicting serialized buffer binding at b{buffer.Slot} in {buffer.Stage}.");
+            }
+        }
 
         var resources = HlslAstBuilder.BuildResources(
             c.Pipeline.Program.Declarations,
@@ -723,11 +737,21 @@ public static class Decompiler
             c.Pipeline.Blocks,
             pass.Cbuffers,
             c.Stage.ToString(),
-            textureNames).ToList();
+            bindings?.Textures ?? textureNames,
+            bindings?.Samplers).ToList();
 
         foreach (HlslResourceNode resource in resources)
         {
-            VerifiedResourceBindings.Attach(pass.Resources, resource, c.Stage.ToString());
+            if (bindings is null)
+                VerifiedResourceBindings.Attach(pass.Resources, resource, c.Stage.ToString());
+            else
+            {
+                resource.Stage = c.Stage.ToString();
+                VerifiedResourceBindings.Validate(resource);
+                if (pass.Resources.Any(existing => existing.Stage == resource.Stage && existing.Kind == resource.Kind && existing.Slot == resource.Slot))
+                    throw new InvalidDataException($"Duplicate serialized {resource.Kind} binding at slot {resource.Slot} in {resource.Stage}.");
+                pass.Resources.Add(resource);
+            }
         }
 
         if (c.Function.InputStruct is not null) pass.Structs.Add(c.Function.InputStruct);
@@ -773,8 +797,9 @@ public static class Decompiler
         };
         foreach (var (k, v) in src.Tags)
             clone.Tags[k] = v;
-        foreach (var (k, v) in src.Cbuffers)
-            clone.Cbuffers[k] = v;
+        if (src.DirectXPrograms.All(reference => reference.Parameters is null))
+            foreach (KeyValuePair<(int Slot, string Stage), CbufferMetadata> entry in src.Cbuffers)
+                clone.Cbuffers[entry.Key] = entry.Value;
         return clone;
     }
 
@@ -875,7 +900,7 @@ public static class Decompiler
             {
                 throw new InvalidDataException($"Variant {previous.Index}/{program.Index} has incompatible interpolators.");
             }
-            AttachPassProgram(pass, program, textureNames, log);
+            AttachPassProgram(pass, program, textureNames, log, reference);
             covered.Add(program.Index);
             previous = program;
         }
@@ -900,11 +925,26 @@ public static class Decompiler
         }
         SetRuntimeShaderTarget(shell, vertex, fragment);
         HlslPassNode leaf = ClonePass(shell);
-        AttachPassProgram(leaf, vertex, textureNames, log);
-        AttachPassProgram(leaf, fragment, textureNames, log);
+        AttachPassProgram(leaf, vertex, textureNames, log, FindSerializedReference(shell, state.Vertex, "Vertex"));
+        AttachPassProgram(leaf, fragment, textureNames, log, FindSerializedReference(shell, state.Fragment, "Fragment"));
         shell.VariantPrograms.Add(leaf);
         covered.Add(state.Vertex);
         covered.Add(state.Fragment);
+    }
+
+    // Finds the bindings for a reused DXBC blob within this exact pass.
+    private static ProgramVariantMetadata FindSerializedReference(HlslPassNode pass, int blobIndex, string stage)
+    {
+        ProgramVariantMetadata[] matches = pass.DirectXPrograms
+            .Where(reference => reference.BlobIndex == blobIndex && reference.Stage == stage).ToArray();
+        if (matches.Length == 0)
+            throw new InvalidDataException($"Missing serialized parameter reference for {stage} program {blobIndex}.");
+        if (matches.Any(reference => reference.Parameters is null != (matches[0].Parameters is null)
+            || reference.Parameters is JsonElement left && matches[0].Parameters is JsonElement right
+                && (!JsonElement.DeepEquals(left.GetProperty("commonParameters"), right.GetProperty("commonParameters"))
+                    || !JsonElement.DeepEquals(left.GetProperty("binaryParameters"), right.GetProperty("binaryParameters")))))
+            throw new InvalidDataException($"Conflicting serialized parameters for {stage} program {blobIndex} in one pass.");
+        return matches[0];
     }
 
     // Requires a common supported shader target across runtime variants.

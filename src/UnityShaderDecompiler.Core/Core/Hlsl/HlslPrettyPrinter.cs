@@ -228,6 +228,11 @@ public static class HlslPrettyPrinter
     private static void PrintPassProgram(StringBuilder sb, HlslPassNode pass, bool fuseTemps,
         bool stripRegisterBindings, bool entryPragmas)
     {
+        if (pass.UseStageBindings)
+        {
+            PrintStageBoundProgram(sb, pass, fuseTemps, stripRegisterBindings, entryPragmas);
+            return;
+        }
         PrintEmptyPassStub(sb, pass);
         // Carries semantic names from vertex outputs to fragment inputs.
         Dictionary<string, string> stageInterpolators = new Dictionary<string, string>();
@@ -264,10 +269,48 @@ public static class HlslPrettyPrinter
 
     }
 
+    // Emits stage-specific bindings as ordinary HLSL declarations.
+    private static void PrintStageBoundProgram(StringBuilder sb, HlslPassNode pass, bool fuseTemps,
+        bool stripRegisterBindings, bool entryPragmas)
+    {
+        Dictionary<string, string> interpolators = new();
+        Dictionary<string, string> renames = new();
+        if (pass.VertexFunction is null || pass.FragmentFunction is null
+            || pass.GeometryFunction is not null || pass.HullFunction is not null
+            || pass.DomainFunction is not null || pass.ComputeFunction is not null)
+            throw new InvalidDataException("Stage-specific serialized bindings require a vertex/fragment pass.");
+        if (entryPragmas)
+            sb.Append("            #pragma vertex vert\n            #pragma fragment frag\n");
+        List<HlslResourceNode> declarations = new();
+        foreach (HlslResourceNode resource in pass.Resources)
+        {
+            HlslResourceNode? duplicate = declarations.FirstOrDefault(item => item.Kind == resource.Kind && item.Name == resource.Name);
+            if (duplicate is null)
+            {
+                declarations.Add(resource);
+                continue;
+            }
+            if (duplicate.Slot != resource.Slot || duplicate.TypeHint != resource.TypeHint)
+                throw new InvalidDataException($"Resource {resource.Name} has different serialized bindings across stages.");
+            foreach (HlslCBufferVariable variable in resource.Variables)
+                if (!duplicate.Variables.Any(item => item.Name == variable.Name))
+                    duplicate.Variables.Add(variable);
+        }
+        VerifiedResourceBindings.ValidatePass(declarations);
+        foreach (HlslResourceNode resource in declarations)
+            PrintResource(sb, resource, stripRegisterBindings, renames);
+        foreach (HlslStructNode structure in pass.Structs)
+            PrintStruct(sb, structure);
+        PrintFunction(sb, pass.VertexFunction, pass.Cbuffers, fuseTemps, stageOutputs: interpolators,
+            resources: pass.Resources.Where(item => item.Stage == "Vertex").ToList(), cbufferRenames: renames);
+        PrintFunction(sb, pass.FragmentFunction, pass.Cbuffers, fuseTemps, stageInputs: interpolators,
+            resources: pass.Resources.Where(item => item.Stage == "Fragment").ToList(), cbufferRenames: renames);
+    }
+
     private static void PrintRenderState(StringBuilder sb, HlslRenderState s)
     {
         sb.Append("            Cull ").Append(s.Cull).Append('\n');
-        sb.Append("            ZTest ").Append(ZTestText(s.ZTest)).Append('\n');
+        sb.Append("            ZTest ").Append(s.ZTestName is null ? ZTestText(s.ZTest) : $"[{s.ZTestName}]").Append('\n');
         sb.Append("            ZWrite ").Append(s.ZWrite ? "On" : "Off").Append('\n');
 
         if (s.Lighting)
@@ -310,6 +353,7 @@ public static class HlslPrettyPrinter
     // 1:1 name mapping.
     private static string ZTestText(HlslCompareFunction f) => f switch
     {
+        HlslCompareFunction.Disabled => "Off",
         HlslCompareFunction.LessEqual => "LEqual",
         HlslCompareFunction.GreaterEqual => "GEqual",
         _ => f.ToString(),
@@ -396,7 +440,8 @@ public static class HlslPrettyPrinter
         return renames;
     }
 
-    private static void PrintResource(StringBuilder sb, HlslResourceNode res, bool stripRegisterBindings, Dictionary<string, string>? cbufferRenames = null)
+    private static void PrintResource(StringBuilder sb, HlslResourceNode res, bool stripRegisterBindings,
+        Dictionary<string, string>? cbufferRenames = null, bool forceBinding = false)
     {
         VerifiedResourceBindings.Validate(res);
 
@@ -407,7 +452,7 @@ public static class HlslPrettyPrinter
         // fragment).  Only emit register(bN) for non-Unity cbuffers.
         string reg = stripRegisterBindings && res.Kind is HlslResourceKind.Texture or HlslResourceKind.Sampler
             ? ""
-            : (res.Kind == HlslResourceKind.ConstantBuffer && IsUnityCbuffer(res.Name))
+            : (res.Kind == HlslResourceKind.ConstantBuffer && IsUnityCbuffer(res.Name) && !forceBinding)
                 ? ""
                 : RegisterBinding(res);
         string regSuffix = string.IsNullOrEmpty(reg) ? "" : " : " + reg;
@@ -1736,6 +1781,16 @@ public static class HlslPrettyPrinter
             return name + MaskOrSwizzleSuffix(reg);
         }
 
+        if (reg.Indices.Count >= 2 && reg.RelativeIndices.Length > 1
+            && reg.RelativeIndices[1] is IRExpression relative
+            && ctx.Cbuffers.TryGetValue((int)reg.Indices[0], out CbufferMetadata? dynamicBuffer)
+            && ResolveDynamicCbufferArray(dynamicBuffer, reg) is CbufferVariableMetadata array)
+        {
+            int baseIndex = checked((int)reg.Indices[1] - array.Offset / 16);
+            string index = RenderExpression(relative, ctx);
+            return $"{array.Name}[{index}{(baseIndex == 0 ? "" : $" + {baseIndex}")}]{MaskOrSwizzleSuffix(reg)}";
+        }
+
         if (reg.Indices.Count >= 2
             && ctx.Cbuffers.TryGetValue((int)reg.Indices[0], out CbufferMetadata? cb)
             && ResolveCbufferRead(cb, reg) is { } named)
@@ -1756,6 +1811,20 @@ public static class HlslPrettyPrinter
         }
 
         throw new InvalidDataException("Unresolved constant-buffer read; refusing anonymous register storage.");
+    }
+
+    // Resolves a relative cbuffer index only when serialized array bounds cover its base slot.
+    internal static CbufferVariableMetadata? ResolveDynamicCbufferArray(CbufferMetadata buffer, IRRegister reg)
+    {
+        if (reg.Indices.Count < 2 || reg.RelativeIndices.Length < 2 || reg.RelativeIndices[1] is null)
+            return null;
+        int slot = checked((int)reg.Indices[1]);
+        CbufferVariableMetadata[] matches = buffer.Variables.Where(variable => variable.ArraySize > 0
+            && !variable.IsMatrix && variable.RowCount == 0 && variable.Offset % 16 == 0
+            && slot >= variable.Offset / 16 && slot < variable.Offset / 16 + variable.ArraySize).ToArray();
+        if (matches.Length > 1)
+            throw new InvalidDataException($"Ambiguous dynamic array access at b{reg.Indices[0]}[{slot}].");
+        return matches.Length == 1 ? matches[0] : null;
     }
 
     // Maps a cbN[reg] register read (plus its component swizzle) onto a
@@ -1798,15 +1867,14 @@ public static class HlslPrettyPrinter
 
         if (best.IsMatrix || best.RowCount > 0)
         {
-            if (best.ArraySize > 0)
-                return null; // array-of-matrices: defer to cbN_values fallback
-
             uint row = rel / 16;
+            if (best.ArraySize > 0)
+                return $"{best.Name}[{row / (uint)best.Rows}][{row % (uint)best.Rows}]{swizzle}";
             return $"{best.Name}[{row}]{swizzle}";
         }
 
         if (best.ArraySize > 0)
-            return null; // array reads: defer to cbN_values fallback
+            return $"{best.Name}[{rel / 16}]{swizzle}";
 
         // Read covers the whole variable — but only when the read is NOT a
         // broadcast (repeated components). A swizzle like .xxyz on a float3

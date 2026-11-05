@@ -237,7 +237,7 @@ public static class HlslAstBuilder
     public static IEnumerable<HlslResourceNode> BuildResources(
         List<IRDeclaration> declarations, RdefChunk? rdef = null, List<IRBlock>? blocks = null,
         Dictionary<(int Slot, string Stage), CbufferMetadata>? cbuffers = null, string stage = "",
-        Dictionary<uint, string>? textureNames = null)
+        Dictionary<uint, string>? textureNames = null, Dictionary<uint, string>? samplerNames = null)
     {
         Dictionary<uint, uint> maxCbufferSlot = BuildMaxCbufferSlot(blocks, cbuffers, stage);
 
@@ -280,8 +280,7 @@ public static class HlslAstBuilder
                     // different buffers to the same slot.
                     if (cbuffers is not null
                         && (cbuffers.TryGetValue(((int)cb.Slot, stage), out CbufferMetadata? meta)
-                            || cbuffers.TryGetValue(((int)cb.Slot, ""), out meta))
-                        && meta.Variables.Count > 0)
+                            || cbuffers.TryGetValue(((int)cb.Slot, ""), out meta)))
                     {
                         var metaNode = new HlslResourceNode
                         {
@@ -336,7 +335,8 @@ public static class HlslAstBuilder
 
                 case IRDeclaration.IRSamplerDeclaration samp:
                     bool isComparison = ComparisonSamplers(blocks).Contains(samp.Slot);
-                    string sampName = VerifiedResourceBindings.RequireName(samp.SymbolicName, "sampler", samp.Slot);
+                    string sampName = samplerNames is not null && samplerNames.TryGetValue(samp.Slot, out string? serializedSampler)
+                        ? serializedSampler : VerifiedResourceBindings.RequireName(samp.SymbolicName, "sampler", samp.Slot);
                     yield return new HlslResourceNode
                     {
                         Name = sampName,
@@ -387,7 +387,12 @@ public static class HlslAstBuilder
                     // Dynamic reads require a resolved array layout.
                     if (reg.RelativeIndices.Length > 1 && reg.RelativeIndices[1] is not null)
                     {
-                        throw new InvalidDataException($"Unresolved dynamic constant-buffer access at b{slot}; an exact array layout is required.");
+                        if (cbuffers is not null
+                            && (cbuffers.TryGetValue(((int)slot, stage), out CbufferMetadata? dynamicBuffer)
+                                || cbuffers.TryGetValue(((int)slot, ""), out dynamicBuffer))
+                            && HlslPrettyPrinter.ResolveDynamicCbufferArray(dynamicBuffer, reg) is not null)
+                            continue;
+                        throw new InvalidDataException($"Unresolved dynamic constant-buffer access at b{slot}[{elem}] in {stage}: {reg.RelativeIndices[1]}; an exact array layout is required.");
                     }
                     // Named reads use the serialized layout without replacement storage.
                     else if (ResolvesToNamedMember(reg, cbuffers, stage))
