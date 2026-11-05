@@ -168,6 +168,7 @@ internal class Program
             ReconstructSurfaceShaders = !args.Contains("--no-surface-shaders"),
             KeepPasses = args.Contains("--keep-passes"),
             KeepRegisterBindings = args.Contains("--keep-register-bindings"),
+            D3d11Only = args.Contains("--d3d11-only"),
             Verbose = true,
         };
 

@@ -21,6 +21,8 @@ namespace UnityShaderDecompiler.Core;
 /// </summary>
 public sealed class DecompileOptions
 {
+    /// <summary>Process only serialized Direct3D 11 subprograms.</summary>
+    public bool D3d11Only { get; init; }
     /// <summary>Abort on decompilation errors instead of logging and continuing.</summary>
     public bool FailOnError { get; init; }
     /// <summary>Keep serialized passes and select their programs through Unity keywords.</summary>
@@ -176,6 +178,14 @@ public static class Decompiler
             {
                 log.WriteLine("NULL");
                 log.WriteLine();
+                continue;
+            }
+
+            if (options.D3d11Only &&
+                (sp.m_ProgramType < ShaderGpuProgramType.DX11VertexSM40 ||
+                 sp.m_ProgramType > ShaderGpuProgramType.DX11DomainSM50))
+            {
+                log.WriteLine($"Skipped non-D3D11 subprogram {i}: {sp.m_ProgramType}");
                 continue;
             }
 
