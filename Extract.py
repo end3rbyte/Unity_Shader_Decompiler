@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -47,6 +48,7 @@ def main():
     # 0.1 â€” blob
     shader = ShaderBlob(str(json_path))
     blob = shader.get_blob()
+    metadata = ShaderMetadata(str(json_path)).build(blob)
 
     out_dir = Path(args.out_dir)
     if not args.flat:
@@ -59,9 +61,9 @@ def main():
     print(f"Saved {blob_path} ({len(blob)} bytes)")
 
     # 0.2 â€” metadata
-    meta = ShaderMetadata(str(json_path))
     meta_path = out_dir / "metadata.json"
-    meta.save(str(meta_path))
+    with open(meta_path, "w", encoding="utf8") as stream:
+        json.dump(metadata, stream, indent=2)
     print(f"Saved {meta_path}")
 
     # 0.3 â€” dummy shader (best effort, not required)
@@ -72,8 +74,12 @@ def main():
         print(f"No dummy export found for '{shader.name}' in {args.dummy_dir}")
 
     print()
-    print(f"Ready for C# side:")
-    print(f"  dotnet run --project \"src/UnityShaderDecompiler.Cli/UnityShaderDecompiler.Cli.csproj\" -- \"{blob_path}\"")
+    if any("programParameters" in shader_pass for subshader in metadata["subShaders"]
+           for shader_pass in subshader["passes"]):
+        print("Per-program parameters extracted; HLSL binding support is required before decompilation.")
+    else:
+        print("Ready for C# side:")
+        print(f"  dotnet run --project \"src/UnityShaderDecompiler.Cli/UnityShaderDecompiler.Cli.csproj\" -- \"{blob_path}\"")
 
 
 if __name__ == "__main__":

@@ -112,8 +112,15 @@ the source JSON. Missing or invalid offsets and conflicting schema aliases fail 
 | File | Contents |
 | --- | --- |
 | `blob.bin` | `m_CompressedBlob`, base64-decoded and LZ4-decompressed |
-| `metadata.json` | flattened `m_ParsedForm`: properties, subshaders, render state, cbuffer layouts |
+| `metadata.json` | flattened `m_ParsedForm` and, when present, exact per-program D3D11 parameter records |
 | `dummy.shader` | optional plain-text reference from `shaders_dummy/`, when a match exists |
+
+For exports with `m_ParameterBlobIndices`, each pass has `programParameters`
+entries keyed by stage, tier, program position, code index, and parameter index.
+Binary and common parameters remain separate. The C# loader rejects these
+entries until HLSL resource binding consumes them; it will not substitute the
+legacy cross-pass constant-buffer layout. Check DXBC declaration coverage with
+`dotnet run --project tests/ParameterSlotsVerifier -- Output/<Name>`.
 
 Then build and run the decompiler:
 

@@ -193,6 +193,10 @@ public sealed class PassMetadata
 
     public static PassMetadata From(JsonElement el)
     {
+        if (el.TryGetProperty("programParameters", out JsonElement _))
+        {
+            throw new InvalidDataException("Per-program shader parameters require HLSL binding support before decompilation.");
+        }
         var result = new PassMetadata
         {
             Name = el.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "",
