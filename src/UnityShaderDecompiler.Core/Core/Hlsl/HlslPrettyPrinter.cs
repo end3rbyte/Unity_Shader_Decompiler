@@ -235,8 +235,9 @@ public static class HlslPrettyPrinter
         // Shares one name for variables at the same constant-buffer offset.
         Dictionary<string, string> cbufferRenames = BuildCbufferRenameMap(pass);
 
-        EnsureUniqueTextureNames(pass.Resources);
+        VerifiedResourceBindings.ValidatePass(pass.Resources);
         PrintPassDeclarations(sb, pass, stripRegisterBindings, cbufferRenames);
+
         if (pass.VertexFunction is not null)
         {
             if (entryPragmas)
@@ -315,27 +316,6 @@ public static class HlslPrettyPrinter
     };
 
     // ---------- Stage 7: Resources ----------
-
-    // Gives textures on different slots distinct HLSL identifiers in one pass.
-    private static void EnsureUniqueTextureNames(List<HlslResourceNode> resources)
-    {
-        HashSet<string> used = new HashSet<string>(StringComparer.Ordinal);
-        foreach (HlslResourceNode resource in resources)
-        {
-            if (resource.Kind != HlslResourceKind.Texture || used.Add(resource.Name))
-            {
-                continue;
-            }
-            string stem = $"{resource.Name}_t{resource.Slot}";
-            string name = stem;
-            int suffix = 1;
-            while (!used.Add(name) || resources.Any(other => !ReferenceEquals(other, resource) && other.Name == name))
-            {
-                name = $"{stem}_{suffix++}";
-            }
-            resource.Name = name;
-        }
-    }
 
     // When vert and frag have different variables at the same byte offset
     // within a merged cbuffer, one must be declared and the other's
@@ -418,13 +398,7 @@ public static class HlslPrettyPrinter
 
     private static void PrintResource(StringBuilder sb, HlslResourceNode res, bool stripRegisterBindings, Dictionary<string, string>? cbufferRenames = null)
     {
-        if (res.Kind == HlslResourceKind.ConstantBuffer
-            && res.Variables.FirstOrDefault(v => v.Name == $"cb{res.Slot}_values" && v.ArraySize is not null) is { } raw)
-        {
-            sb.Append("            cbuffer ").Append(CbufferName(res)).Append(" : register(b").Append(res.Slot)
-              .Append(") { float4 ").Append(raw.Name).Append('[').Append(raw.ArraySize).Append("]; };\n");
-            return;
-        }
+        VerifiedResourceBindings.Validate(res);
 
         // Unity standard cbuffers are assigned to per-stage slots by Unity's
         // compiler from the cbuffer NAME alone — an explicit register binding
@@ -653,6 +627,7 @@ public static class HlslPrettyPrinter
         public bool PreserveArithmetic { get; init; }
         public bool RawTemporaryStorage { get; init; }
 
+
         // Identifier each defining instruction actually declared for a
         // value, keyed by the value's structural identity (storage location
         // + SSA version), NOT by its rendered name string. Reads resolve
@@ -748,11 +723,6 @@ public static class HlslPrettyPrinter
         if (resources is not null)
             foreach (HlslResourceNode res in resources)
             {
-                if (res.Kind == HlslResourceKind.ConstantBuffer
-                    && res.Variables.Any(v => v.Name == $"cb{res.Slot}_values" && v.ArraySize is not null))
-                    {
-                    ctx.RawCbufferSlots.Add((int)res.Slot);
-                }
                 if (res.Kind == HlslResourceKind.Texture)
                 {
                     ctx.TextureTypeBySlot[(int)res.Slot] = res.TypeHint ?? "Texture2D";
@@ -1758,10 +1728,6 @@ public static class HlslPrettyPrinter
     //   3. synthesized cbN_values[slot] fallback array.
     private static string RenderCbufferRead(IRRegister reg, PrintContext ctx)
     {
-        if (reg.Indices.Count >= 2 && ctx.RawCbufferSlots.Contains((int)reg.Indices[0]))
-            {
-            return CbufferElementName(reg, ctx) + MaskOrSwizzleSuffix(reg);
-        }
         if (reg.SymbolicName is not null)
         {
             string name = reg.SymbolicName;
@@ -1789,7 +1755,7 @@ public static class HlslPrettyPrinter
             return named;
         }
 
-        return CbufferElementName(reg, ctx) + MaskOrSwizzleSuffix(reg);
+        throw new InvalidDataException("Unresolved constant-buffer read; refusing anonymous register storage.");
     }
 
     // Maps a cbN[reg] register read (plus its component swizzle) onto a

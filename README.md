@@ -251,6 +251,12 @@ Each subprogram goes through `IRPipeline` (`DXBC/IR/IRPipeline.cs`):
     Same-named resources keep distinct binding slots; raw constant-buffer fallback
     storage preserves the serialized extent and starts at byte zero.
     Temporary names retain register identity to avoid collisions.
+    Resource names must come from reflection or binding metadata, never property
+    order. Missing names, unresolved constant-buffer reads, overlapping layouts
+    and incompatible stage bindings stop emission. Partial metadata cannot replace
+    named uniforms with raw arrays. Existing stripped fixtures require complete
+    parameter extraction before they can pass this stricter contract.
+
 11. **AST build** — one function node per subprogram; the
     Shader/SubShader/Pass shell comes from `metadata.json`.
 12. **Pass and variant recovery** — use serialized program references when
