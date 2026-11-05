@@ -30,7 +30,7 @@ public sealed class HlslShaderNode
 }
 
 // Mirrors Unity's serialized shader property type enum
-// (m_Type: Color=0, Vector=1, Float=2, Range=3, Texture=4).
+// (m_Type: Color=0, Vector=1, Float=2, Range=3, Texture=4, Int=5).
 public enum HlslPropertyKind
 {
     Color = 0,
@@ -38,6 +38,7 @@ public enum HlslPropertyKind
     Float = 2,
     Range = 3,
     Texture = 4,
+    Integer = 5,
     Unknown = -1,
 }
 
@@ -176,6 +177,10 @@ public sealed class HlslRenderState
 
 public sealed class HlslPassNode
 {
+    internal RuntimeVariantPlan? RuntimeVariants { get; set; }
+    internal List<HlslPassNode> VariantPrograms { get; } = new();
+    internal string ShaderTarget { get; set; } = "4.0";
+    public List<ProgramVariantMetadata> DirectXPrograms { get; } = new();
     public string Name { get; init; } = "";
     public Dictionary<string, string> Tags { get; } = new();
 
@@ -231,6 +236,7 @@ public enum HlslShaderStage
 
 public sealed class HlslFunctionNode
 {
+    public bool RawTemporaryStorage { get; set; }
     // Canonical per-stage name (Stage 9): vert/frag/geom/hull/domain/comp.
     // No collision risk between passes — each Pass has its own function
     // slots, so every pass's vertex function is just called "vert".
@@ -291,6 +297,7 @@ public sealed class HlslCBufferVariable
 public sealed class HlslResourceNode
 {
     public string Name { get; set; } = "";
+    public string Stage { get; set; } = "";
     public HlslResourceKind Kind { get; init; }
     public uint Slot { get; init; }
 
@@ -298,6 +305,8 @@ public sealed class HlslResourceNode
     // IRDeclaration carries enough info (ResourceDimension); left null
     // otherwise rather than guessing.
     public string? TypeHint { get; init; }
+
+    public uint StructureStride { get; init; }
 
     // Only populated for Kind == ConstantBuffer, from RDEF (the actual
     // member layout Unity's compiler produced) — empty if no RDEF match

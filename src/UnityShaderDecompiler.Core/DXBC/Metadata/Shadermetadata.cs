@@ -19,6 +19,7 @@ public sealed class ShaderMetadata
     public string Fallback { get; init; } = "";
     public string CustomEditor { get; init; } = "";
     public List<string> Keywords { get; init; } = new();
+    public Dictionary<string, int> KeywordFlags { get; } = new(StringComparer.Ordinal);
     public List<string> Dependencies { get; init; } = new();
     public JsonElement Raw { get; init; }
 
@@ -41,6 +42,14 @@ public sealed class ShaderMetadata
             foreach (var k in kw.EnumerateArray())
                 if (k.ValueKind == JsonValueKind.String)
                     meta.Keywords.Add(k.GetString() ?? "");
+        }
+
+        if (root.TryGetProperty("keywordFlags", out JsonElement keywordFlags))
+            {
+            foreach (JsonProperty keyword in keywordFlags.EnumerateObject())
+                {
+                meta.KeywordFlags.Add(keyword.Name, keyword.Value.GetInt32());
+            }
         }
 
         if (root.TryGetProperty("properties", out var props) && props.ValueKind == JsonValueKind.Array)
@@ -121,6 +130,14 @@ public sealed class ShaderProperty
 
     private static float[] ParseDefaultComponents(JsonElement el)
     {
+        if (el.TryGetProperty("type", out JsonElement propertyType) && propertyType.ToString() == "5"
+            && (!el.TryGetProperty("defaultValue", out JsonElement integerDefault)
+                || integerDefault.ValueKind != JsonValueKind.Object
+                || !integerDefault.TryGetProperty("x", out JsonElement integerBits)
+                || integerBits.ValueKind != JsonValueKind.Number))
+            {
+            throw new InvalidDataException("Integer property requires a numeric serialized default.");
+        }
         if (!el.TryGetProperty("defaultValue", out var dv) || dv.ValueKind != JsonValueKind.Object)
             return Array.Empty<float>();
 
@@ -164,6 +181,7 @@ public sealed class SubShaderMetadata
 
 public sealed class PassMetadata
 {
+    public List<ProgramVariantMetadata> DirectXPrograms { get; } = new();
     public string Name { get; init; } = "";
     public Dictionary<string, string> Tags { get; init; } = new();
     public JsonElement RenderState { get; init; }
@@ -175,6 +193,10 @@ public sealed class PassMetadata
 
     public static PassMetadata From(JsonElement el)
     {
+        if (el.TryGetProperty("programParameters", out JsonElement _))
+        {
+            throw new InvalidDataException("Per-program shader parameters require HLSL binding support before decompilation.");
+        }
         var result = new PassMetadata
         {
             Name = el.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "",
@@ -189,14 +211,29 @@ public sealed class PassMetadata
             foreach (var cb in cbs.EnumerateArray())
                 result.ConstantBuffers.Add(CbufferMetadata.From(cb));
 
+        if (el.TryGetProperty("directXPrograms", out JsonElement programs))
+            {
+            foreach (JsonElement program in programs.EnumerateArray())
+                {
+                result.DirectXPrograms.Add(new ProgramVariantMetadata(
+                    program.GetProperty("blobIndex").GetInt32(),
+                    program.GetProperty("stage").GetString()!,
+                    program.GetProperty("keywords").EnumerateArray().Select(k => k.GetString()!).ToArray(),
+                    program.GetProperty("keywordMask").EnumerateArray().Select(k => k.GetString()!).ToArray()));
+            }
+        }
+
         return result;
     }
 }
+
+
 
 /// <summary>One cbuffer in a pass: register slot -> name + variables.</summary>
 public sealed class CbufferMetadata
 {
     public int Slot { get; init; } = -1;
+    public int Size { get; init; }
     // Stage this buffer is bound in (Vertex/Fragment/Geometry/...). Stages
     // bind their own cbuffer tables, so two different buffers can legally
     // share a slot number across stages (e.g. UnityPerDraw and $Globals
@@ -212,6 +249,9 @@ public sealed class CbufferMetadata
             Slot = el.TryGetProperty("slot", out var s) && s.ValueKind == JsonValueKind.Number
                 ? s.GetInt32()
                 : -1,
+            Size = el.TryGetProperty("size", out JsonElement size) && size.ValueKind == JsonValueKind.Number
+                ? size.GetInt32()
+                : 0,
             Stage = el.TryGetProperty("stage", out var st) && st.ValueKind == JsonValueKind.String
                 ? st.GetString() ?? ""
                 : "",

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -87,7 +88,8 @@ public static class HlslPrettyPrinter
         HlslPropertyKind.Color => "Color",
         HlslPropertyKind.Vector => "Vector",
         HlslPropertyKind.Float => "Float",
-        HlslPropertyKind.Range when p.Range is { } r => $"Range({r.Min}, {r.Max})",
+        HlslPropertyKind.Integer => "Integer",
+        HlslPropertyKind.Range when p.Range is { } r => FormattableString.Invariant($"Range({r.Min}, {r.Max})"),
         // Range with no recovered bounds (metadata carried no default value,
         // so min/max slots are absent) — emit as Float rather than
         // fabricate a (0,1) that might be wrong.
@@ -108,6 +110,19 @@ public static class HlslPrettyPrinter
         if (p.Kind == HlslPropertyKind.Texture)
             return "\"\" {}";
 
+        if (p.Kind == HlslPropertyKind.Integer)
+        {
+            // Unity stores integer property bits in the serialized float slot.
+            float value = p.DefaultComponents.Length == 4 ? p.DefaultComponents[0]
+                : p.DefaultValue is { } integerDefault && integerDefault.TryGetProperty("x", out JsonElement x)
+                    ? x.GetSingle() : throw new InvalidDataException("Integer property has no serialized default.");
+            if (!float.IsFinite(value))
+                {
+                throw new InvalidDataException("Integer property bits cannot be recovered from a non-finite JSON float.");
+            }
+            return BitConverter.SingleToInt32Bits(value).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
         // Typed default (Metadata layer, float[4] — the same {x,y,z,w} the
         // printer used to read out of the raw JsonElement below).
         if (p.DefaultComponents.Length == 4)
@@ -115,8 +130,8 @@ public static class HlslPrettyPrinter
             float x = p.DefaultComponents[0], y = p.DefaultComponents[1],
                   z = p.DefaultComponents[2], w = p.DefaultComponents[3];
             return p.Kind is HlslPropertyKind.Color or HlslPropertyKind.Vector
-                ? $"({x},{y},{z},{w})"
-                : x.ToString();
+                ? FormattableString.Invariant($"({x},{y},{z},{w})")
+                : x.ToString("R", CultureInfo.InvariantCulture);
         }
 
         if (p.DefaultValue is not { } dv || dv.ValueKind != JsonValueKind.Object)
@@ -128,8 +143,8 @@ public static class HlslPrettyPrinter
         double W() => dv.TryGetProperty("w", out var w) ? w.GetDouble() : 0;
 
         return p.Kind is HlslPropertyKind.Color or HlslPropertyKind.Vector
-            ? $"({X()},{Y()},{Z()},{W()})"
-            : X().ToString();
+            ? FormattableString.Invariant($"({X()},{Y()},{Z()},{W()})")
+            : X().ToString("R", CultureInfo.InvariantCulture);
     }
 
     // ---------- Stage 5: SubShader ----------
@@ -167,57 +182,86 @@ public static class HlslPrettyPrinter
         PrintTags(sb, pass.Tags, indent: "            ");
         PrintRenderState(sb, pass.State);
 
-        // Empty pass (no decompiled functions) — emit a valid stub so
-        // pass indices stay stable for Graphics.Blit(material, passIndex).
-        bool hasAnyFunction = pass.VertexFunction is not null || pass.FragmentFunction is not null
-            || pass.GeometryFunction is not null || pass.HullFunction is not null
-            || pass.DomainFunction is not null || pass.ComputeFunction is not null;
-
         sb.Append("            HLSLPROGRAM\n");
-
-        if (!hasAnyFunction)
+        if (pass.RuntimeVariants is RuntimeVariantPlan plan)
         {
-            sb.AppendLine("            #pragma vertex vert");
-            sb.AppendLine("            #pragma fragment frag");
-            sb.AppendLine("            cbuffer _StubCB : register(b1) { float4x4 unity_MatrixVP; };");
-            sb.AppendLine("            struct v2f { float4 pos : SV_POSITION; };");
-            sb.AppendLine("            v2f vert(float4 v : POSITION) { v2f o; o.pos = mul(unity_MatrixVP, v); return o; }");
-            sb.AppendLine("            float4 frag(v2f i) : SV_Target { return 0; }");
+            sb.Append("            #pragma only_renderers d3d11\n");
+            sb.Append($"            #pragma target {pass.ShaderTarget}\n");
+            sb.Append("            #pragma vertex vert\n");
+            sb.Append("            #pragma fragment frag\n");
+            foreach (RuntimeKeywordGroup group in plan.Groups)
+            {
+                string directive = group.Local ? "multi_compile_local" : "multi_compile";
+                string choices = (group.AllowsDisabled ? "__ " : "") + string.Join(" ", group.Keywords);
+                sb.Append($"            #pragma {directive} {choices}\n");
+            }
+            foreach (string keyword in plan.StrippedKeywords)
+            {
+                string directive = plan.LocalKeywords.Contains(keyword) ? "multi_compile_local" : "multi_compile";
+                sb.Append($"            #pragma {directive} __ {keyword}\n");
+                sb.Append($"            #pragma skip_variants {keyword}\n");
+            }
+            for (int index = 0; index < plan.States.Count; index++)
+            {
+                HashSet<string> enabled = plan.States[index].Keywords.ToHashSet(StringComparer.Ordinal);
+                string condition = string.Join(" && ", plan.Mask.Select(keyword =>
+                    (enabled.Contains(keyword) ? "" : "!") + $"defined({keyword})"));
+                if (condition.Length == 0) {
+                    condition = "1";
+                }
+                sb.Append($"            #{(index == 0 ? "if" : "elif")} {condition}\n");
+                PrintPassProgram(sb, pass.VariantPrograms[index], fuseTemps, stripRegisterBindings, false);
+            }
+            sb.Append("            #else\n");
+            sb.Append("            #error No serialized program matches this shader keyword state\n");
+            sb.Append("            #endif\n");
         }
+        else
+        {
+            PrintPassProgram(sb, pass, fuseTemps, stripRegisterBindings, true);
+        }
+        sb.Append("            ENDHLSL\n");
+        sb.Append("        }\n");
+    }
 
-        // Interpolator hand-off map: the vertex stage records which semantic
-        // fields carry named values (worldPos, worldNormal, ...) so the
-        // fragment stage can seed the matching input registers.
-        var stageInterpolators = new Dictionary<string, string>();
+    // Emits resource declarations and functions for one shader pass.
+    private static void PrintPassProgram(StringBuilder sb, HlslPassNode pass, bool fuseTemps,
+        bool stripRegisterBindings, bool entryPragmas)
+    {
+        PrintEmptyPassStub(sb, pass);
+        // Carries semantic names from vertex outputs to fragment inputs.
+        Dictionary<string, string> stageInterpolators = new Dictionary<string, string>();
 
-        // Build cross-stage cbuffer variable rename mapping: when vert and
-        // frag have different variables at the same byte offset within a
-        // merged cbuffer, one variable is declared and the other's references
-        // in the function body are redirected.
-        var cbufferRenames = BuildCbufferRenameMap(pass);
+        // Shares one name for variables at the same constant-buffer offset.
+        Dictionary<string, string> cbufferRenames = BuildCbufferRenameMap(pass);
 
-        foreach (HlslResourceNode res in pass.Resources)
-            PrintResource(sb, res, stripRegisterBindings, cbufferRenames);
-
-        foreach (HlslStructNode s in pass.Structs)
-            PrintStruct(sb, s);
+        VerifiedResourceBindings.ValidatePass(pass.Resources);
+        PrintPassDeclarations(sb, pass, stripRegisterBindings, cbufferRenames);
 
         if (pass.VertexFunction is not null)
         {
-            sb.Append("            #pragma vertex vert\n");
+            if (entryPragmas)
+            {
+                sb.Append("            #pragma vertex vert\n");
+            }
             PrintFunction(sb, pass.VertexFunction, pass.Cbuffers, fuseTemps, stageOutputs: stageInterpolators, resources: pass.Resources, cbufferRenames: cbufferRenames);
         }
         if (pass.FragmentFunction is not null)
         {
-            sb.Append("            #pragma fragment frag\n");
+            if (entryPragmas)
+            {
+                sb.Append("            #pragma fragment frag\n");
+            }
             PrintFunction(sb, pass.FragmentFunction, pass.Cbuffers, fuseTemps, stageInputs: stageInterpolators, resources: pass.Resources, cbufferRenames: cbufferRenames);
         }
         foreach (HlslFunctionNode? f in new[] { pass.GeometryFunction, pass.HullFunction, pass.DomainFunction, pass.ComputeFunction })
+        {
             if (f is not null)
+            {
                 PrintFunction(sb, f, pass.Cbuffers, fuseTemps, resources: pass.Resources, cbufferRenames: cbufferRenames);
+            }
+        }
 
-        sb.Append("            ENDHLSL\n");
-        sb.Append("        }\n");
     }
 
     private static void PrintRenderState(StringBuilder sb, HlslRenderState s)
@@ -233,7 +277,7 @@ public static class HlslPrettyPrinter
             sb.Append("            AlphaToMask On\n");
 
         if (s.OffsetFactor != 0 || s.OffsetUnits != 0)
-            sb.Append("            Offset ").Append(s.OffsetFactor).Append(", ").Append(s.OffsetUnits).Append('\n');
+            sb.Append("            Offset ").Append(s.OffsetFactor.ToString("R", CultureInfo.InvariantCulture)).Append(", ").Append(s.OffsetUnits.ToString("R", CultureInfo.InvariantCulture)).Append('\n');
 
         if (!(s.Blend.SrcBlend == HlslBlendMode.One && s.Blend.DstBlend == HlslBlendMode.Zero))
         {
@@ -354,6 +398,8 @@ public static class HlslPrettyPrinter
 
     private static void PrintResource(StringBuilder sb, HlslResourceNode res, bool stripRegisterBindings, Dictionary<string, string>? cbufferRenames = null)
     {
+        VerifiedResourceBindings.Validate(res);
+
         // Unity standard cbuffers are assigned to per-stage slots by Unity's
         // compiler from the cbuffer NAME alone — an explicit register binding
         // would conflict when vertex and fragment map the same name to
@@ -375,9 +421,7 @@ public static class HlslPrettyPrinter
                 // same name causes "Duplicate constant buffer declaration".
                 // Rename them while keeping ALL variables and the register
                 // binding so the bytecode still reads from the correct slot.
-                string cbufferName = IsUnityCbuffer(res.Name)
-                    ? $"_{res.Name.TrimStart('_')}CB_b{res.Slot}"
-                    : res.Name;
+                string cbufferName = CbufferName(res);
 
                 sb.Append("            cbuffer ").Append(cbufferName);
                 if (!string.IsNullOrEmpty(reg))
@@ -506,7 +550,17 @@ public static class HlslPrettyPrinter
                 break;
 
             case HlslResourceKind.Texture:
-                sb.Append("            ").Append(res.TypeHint ?? "Texture2D").Append(' ').Append(res.Name).Append(regSuffix).Append(";\n");
+                if (res.StructureStride > 0)
+                {
+                    sb.Append("            struct ").Append(res.Name).Append("_element { uint value[")
+                      .Append(res.StructureStride / 4).Append("]; };\n");
+                    sb.Append("            StructuredBuffer<").Append(res.Name).Append("_element> ")
+                      .Append(res.Name).Append(regSuffix).Append(";\n");
+                }
+                else
+                    {
+                    sb.Append("            ").Append(res.TypeHint ?? "Texture2D").Append(' ').Append(res.Name).Append(regSuffix).Append(";\n");
+                }
                 break;
 
             case HlslResourceKind.Sampler:
@@ -540,6 +594,11 @@ public static class HlslPrettyPrinter
     private static bool IsUnityCbuffer(string name) =>
         name.StartsWith("Unity", StringComparison.Ordinal) || name == "_Globals";
 
+    // A partial member layout does not invalidate the recovered buffer identity.
+    private static string CbufferName(HlslResourceNode resource) => IsUnityCbuffer(resource.Name)
+        ? $"_{resource.Name.TrimStart('_')}CB_b{resource.Slot}"
+        : resource.Name;
+
     // ---------- Stage 8: Structs ----------
 
     private static void PrintStruct(StringBuilder sb, HlslStructNode s)
@@ -563,6 +622,11 @@ public static class HlslPrettyPrinter
         // Cbuffer layout from the ShaderLab metadata (slot -> buffer),
         // used to render RDEF-less cbN[slot] reads as real variable names.
         public Dictionary<int, CbufferMetadata> Cbuffers { get; set; } = new();
+
+        public HashSet<int> RawCbufferSlots { get; } = new();
+        public bool PreserveArithmetic { get; init; }
+        public bool RawTemporaryStorage { get; init; }
+
 
         // Identifier each defining instruction actually declared for a
         // value, keyed by the value's structural identity (storage location
@@ -648,6 +712,8 @@ public static class HlslPrettyPrinter
         {
             Cbuffers = cbuffers,
             Stage = fn.Stage,
+            PreserveArithmetic = !fuseTemps || fn.RawTemporaryStorage,
+            RawTemporaryStorage = fn.RawTemporaryStorage,
             InputElements = fn.InputElementsByRegister,
             OutputElements = fn.OutputElementsByRegister,
         };
@@ -671,8 +737,10 @@ public static class HlslPrettyPrinter
 
         HlslSemanticNaming.Apply(fn.Statements, cbuffers, stageInputs, stageOutputs);
 
-        if (fuseTemps)
+        if (fuseTemps && !fn.RawTemporaryStorage)
+            {
             HlslFuseTemps.Apply(fn.Statements, MaxFuseNodes);
+        }
 
         // Buffer the body so the Unity macro defines collected during
         // printing (ctx.Macros) can be emitted ahead of the statements that
@@ -690,7 +758,7 @@ public static class HlslPrettyPrinter
         // multiplies (CollapseMatrixMul), then common math idioms (normalize,
         // dot, lerp, vector-by-matrix mul) simplify. Must run after
         // PrintBlock so every use in the body is visible.
-        sb.Append(HlslMathSimplify.Simplify(body.ToString()));
+        sb.Append(fuseTemps ? HlslMathSimplify.Simplify(body.ToString()) : body.ToString());
         sb.Append("            }\n");
     }
 
@@ -732,8 +800,12 @@ public static class HlslPrettyPrinter
                 for (int k = i; k < j; k++)
                     lines.AddRange(RenderStatementLines(stmts[k], ctx));
 
-                foreach (string line in CollapseExtractChains(RevertUnityMacros(lines, ctx), ctx))
+                foreach (string line in ctx.PreserveArithmetic
+                    ? lines
+                    : CollapseExtractChains(RevertUnityMacros(lines, ctx), ctx))
+                    {
                     sb.Append(pad).Append(line).Append('\n');
+                }
                 i = j;
             }
             else
@@ -1475,17 +1547,12 @@ public static class HlslPrettyPrinter
         {
             case HlslIfStatement iff:
             {
-                // Cross-branch phi copies (IRLeaveSsa writes the same
-                // post-merge name at the top level of BOTH arms) must have
-                // their declaration hoisted above the if. Declared per-arm,
-                // the name is scoped to that arm's braces and dies at the
-                // `}` — the sibling arm's write and any post-merge read
-                // would then reference an identifier never in scope.
+                // Declare branch-written values outside the if so later reads remain in scope.
                 foreach ((string name, int comps) in CrossBranchMergeNames(iff, ctx))
                 {
                     if (!ctx.Declared.Add(name))
                         continue; // already in scope — don't redeclare
-                    sb.Append(pad).Append(DeclType(comps)).Append(' ').Append(name).Append(";\n");
+                    sb.Append(pad).Append(DeclType(comps, ctx)).Append(' ').Append(name).Append(";\n");
                 }
 
                 sb.Append(pad).Append("if (").Append(RenderExpression(iff.Condition, ctx)).Append(")\n");
@@ -1516,7 +1583,7 @@ public static class HlslPrettyPrinter
                 {
                     if (!ctx.Declared.Add(name))
                         continue; // already in scope — don't redeclare
-                    sb.Append(pad).Append(DeclType(comps)).Append(' ').Append(name).Append(";\n");
+                    sb.Append(pad).Append(DeclType(comps, ctx)).Append(' ').Append(name).Append(";\n");
                 }
 
                 sb.Append(pad).Append("[loop]\n").Append(pad).Append("while (true)\n").Append(pad).Append("{\n");
@@ -1606,8 +1673,18 @@ public static class HlslPrettyPrinter
 
     private static string BaseIdentifier(IRRegister reg, PrintContext ctx)
     {
+        if (reg.RegisterType == RegisterType.Resource
+            && ctx.TextureNameBySlot.TryGetValue((int)reg.Index, out string? textureName))
+        {
+            return textureName;
+        }
         if (reg.SymbolicName is not null)
-            return reg.SymbolicName;
+            return reg.RegisterType switch
+            {
+                RegisterType.Temp => $"{reg.SymbolicName}_r{reg.Index}",
+                RegisterType.IndexableTemp => $"{reg.SymbolicName}_x{reg.Index}",
+                _ => reg.SymbolicName,
+            };
 
         return reg.RegisterType switch
         {
@@ -1678,7 +1755,7 @@ public static class HlslPrettyPrinter
             return named;
         }
 
-        return CbufferElementName(reg, ctx) + MaskOrSwizzleSuffix(reg);
+        throw new InvalidDataException("Unresolved constant-buffer read; refusing anonymous register storage.");
     }
 
     // Maps a cbN[reg] register read (plus its component swizzle) onto a
@@ -1847,7 +1924,7 @@ public static class HlslPrettyPrinter
                 : $"{firstName}.{readLetters}";
         }
 
-        return $"float{active.Count}({string.Join(", ", resolved.Select(r => ComponentView(r.Name, r.Active, r.Comp)))})";
+        return $"{DeclType(active.Count, ctx)}({string.Join(", ", resolved.Select(r => ComponentView(r.Name, r.Active, r.Comp)))})";
     }
 
     // Renders one component of a declared name: a scalar declaration
@@ -1934,6 +2011,10 @@ public static class HlslPrettyPrinter
                 BaseIdentifier(reg, ctx) + MaskOrSwizzleSuffix(reg),
         };
 
+        if (ctx.RawTemporaryStorage && reg.RegisterType is RegisterType.Temp or RegisterType.IndexableTemp)
+            {
+            rendered = $"asfloat({rendered})";
+        }
         return ApplyRegisterModifier(reg.Modifier, rendered);
     }
 
@@ -2055,25 +2136,34 @@ public static class HlslPrettyPrinter
             if (groups.Count == 1 && groups[0].Positions.Count == active.Count)
             {
                 var (el, pos) = groups[0];
-                yield return $"o.{ElementFieldName(el)}{ElementLocalSuffix(el, pos)} = {rhs};";
+                yield return $"o.{ElementFieldName(el)}{ElementLocalSuffix(el, pos)} = {OutputValue(rhs, el, ctx)};";
             }
             else if (groups.Count > 1)
             {
                 foreach ((SignatureElement el, List<int> pos) in groups)
                 {
                     string slice = string.Concat(pos.Select(p => ComponentLetters[p]));
-                    yield return $"o.{ElementFieldName(el)}{ElementLocalSuffix(el, pos)} = ({rawRhs}).{slice};";
+                    yield return $"o.{ElementFieldName(el)}{ElementLocalSuffix(el, pos)} = {OutputValue($"({rawRhs}).{slice}", el, ctx)};";
                 }
             }
             else
             {
-                yield return $"o.{FieldNameFor(dest, ctx)}{MaskOrSwizzleSuffix(dest)} = {rhs};";
+                yield return $"o.{FieldNameFor(dest, ctx)}{MaskOrSwizzleSuffix(dest)} = {OutputValue(rhs, null, ctx)};";
             }
             yield break;
         }
 
-        yield return $"o.{FieldNameFor(dest, ctx)}{MaskOrSwizzleSuffix(dest)} = {rhs};";
+        yield return $"o.{FieldNameFor(dest, ctx)}{MaskOrSwizzleSuffix(dest)} = {OutputValue(rhs, elements?.FirstOrDefault(), ctx)};";
     }
+
+    // Converts register bits to the declared output component type.
+    private static string OutputValue(string bits, SignatureElement? element, PrintContext ctx) =>
+        !ctx.RawTemporaryStorage ? bits : element?.ComponentType switch
+        {
+            1 => bits,
+            2 => $"asint({bits})",
+            _ => $"asfloat({bits})",
+        };
 
     // Emits one or more statement lines for a single destination write.
     // Multiple lines only happen when the written components have
@@ -2133,12 +2223,16 @@ public static class HlslPrettyPrinter
                         continue;
                     string scalar = ScalarIdentifier(src, c, ctx);
                     if (ctx.Declared.Add(scalar))
-                        yield return $"float {scalar};";
+                        yield return $"{DeclType(1, ctx)} {scalar};";
                 }
             }
         }
 
         string rawRhs = RenderExpression(expr, ctx);
+        if (ctx.RawTemporaryStorage && dest.RegisterType is RegisterType.Temp or RegisterType.IndexableTemp or RegisterType.Output)
+            {
+            rawRhs = EncodeRegisterBits(rawRhs, expr);
+        }
 
         // DXBC computes full-lane expressions (the source operand's 4-wide
         // swizzle) regardless of how many components the destination
@@ -2177,7 +2271,7 @@ public static class HlslPrettyPrinter
                     ctx.DeclaredViews[(LocationOf(dest, c), vv)] = (name, active);
 
             yield return ctx.Declared.Add(name)
-                ? $"{DeclType(active.Count)} {name} = {rhs};"
+                ? $"{DeclType(active.Count, ctx)} {name} = {rhs};"
                 : $"{name} = {rhs};";
             yield break;
         }
@@ -2194,8 +2288,13 @@ public static class HlslPrettyPrinter
             string scalarName = ScalarIdentifier(dest, c, ctx);
             if (dest.SsaVersion[c] is { } v)
                 ctx.DeclaredViews[(LocationOf(dest, c), v)] = (scalarName, new List<int> { c });
-            string line = $"{scalarName} = {ExtractComponent(expr, c, ctx)};";
-            yield return ctx.Declared.Add(scalarName) ? $"float {line}" : line;
+            string component = ExtractComponent(expr, c, ctx);
+            if (ctx.RawTemporaryStorage)
+                {
+                component = EncodeRegisterBits(component, expr);
+            }
+            string line = $"{scalarName} = {component};";
+            yield return ctx.Declared.Add(scalarName) ? $"{DeclType(1, ctx)} {line}" : line;
         }
     }
 
@@ -2228,12 +2327,26 @@ public static class HlslPrettyPrinter
                 Operand.OperandComponentMode.Select1 => r.Component,
                 _ => pos,
             };
-            return ResolveComponent(r, source, ctx);
+            string value = ResolveComponent(r, source, ctx);
+            return ctx.RawTemporaryStorage ? $"asfloat({value})" : value;
         }
         return $"({RenderExpression(expr, ctx)}).{ComponentLetters[component]}";
     }
 
-    private static string DeclType(int componentCount) => componentCount == 1 ? "float" : $"float{componentCount}";
+    private static string DeclType(int componentCount, PrintContext ctx)
+    {
+        string type = ctx.RawTemporaryStorage ? "uint" : "float";
+        return componentCount == 1 ? type : $"{type}{componentCount}";
+    }
+
+    // Preserves the raw bits of values written to temporary registers.
+    private static string EncodeRegisterBits(string value, IRExpression expression) => expression switch
+    {
+        IRExpression.RegisterExpression => $"asuint({value})",
+        _ when expression.Type == IRValueType.Bool => $"(({value}) ? 0xffffffffu : 0u)",
+        _ when expression.Type == IRValueType.UInt => value,
+        _ => $"asuint({value})",
+    };
 
     // HLSL (like C) won't assign a wide vector into a narrower L-value, but
     // DXBC's per-lane semantics mean the RHS expression naturally renders at
@@ -2281,7 +2394,9 @@ public static class HlslPrettyPrinter
         IRExpression.DotProductExpression => 1,
         IRExpression.SwizzleExpression s => Math.Max(1, s.Components.Count),
         IRExpression.MatrixVectorMultiplyExpression mv => Math.Max(1, mv.Rows.Count),
-        IRExpression.TextureOperationExpression tex => TextureOpWidth(tex.Operation),
+        IRExpression.TextureOperationExpression tex => tex.Operation == IRExpression.TextureOperation.LoadStructured
+            ? Math.Max(1, MaskIndices(tex.DestinationMask).Count)
+            : TextureOpWidth(tex.Operation),
         _ => 1,
     };
 
@@ -2355,20 +2470,53 @@ public static class HlslPrettyPrinter
     // HlslIfStatement print case). Returns (rendered name, component count
     // for the declaration type), mirroring the exact naming/typing
     // RenderAssignmentLines will produce when it prints those same writes.
-    private static List<(string Name, int Components)> CrossBranchMergeNames(HlslIfStatement iff, PrintContext ctx)
+    private static Dictionary<string, int> CrossBranchMergeNames(HlslIfStatement iff, PrintContext ctx)
     {
-        var result = new List<(string, int)>();
+        Dictionary<string, int> result = new Dictionary<string, int>();
         if (iff.Else is null)
             return result;
-
-        Dictionary<string, int> thenNames = WrittenDeclNames(iff.Then.Statements, ctx);
-        Dictionary<string, int> elseNames = WrittenDeclNames(iff.Else.Statements, ctx);
-
+        Dictionary<string, int> thenNames = new Dictionary<string, int>();
+        Dictionary<string, int> elseNames = new Dictionary<string, int>();
+        AddNames(iff.Then, thenNames, ctx);
+        AddNames(iff.Else, elseNames, ctx);
         foreach ((string name, int comps) in thenNames)
-            if (elseNames.TryGetValue(name, out int elseComps))
-                result.Add((name, Math.Max(comps, elseComps)));
-
+            result[name] = comps;
+        foreach ((string name, int comps) in elseNames)
+            result[name] = Math.Max(result.GetValueOrDefault(name), comps);
         return result;
+    }
+
+    // Collects temporary register names used by an expression.
+    private static void AddNames(HlslBlockStatement block, Dictionary<string, int> names, PrintContext ctx)
+    {
+        foreach ((string name, int comps) in WrittenDeclNames(block.Statements, ctx))
+            if (!names.TryGetValue(name, out int prev) || comps > prev)
+            {
+                names[name] = comps;
+            }
+
+        foreach (HlslStatementNode stmt in block.Statements)
+        {
+            switch (stmt)
+            {
+                case HlslIfStatement nested:
+                    AddNames(nested.Then, names, ctx);
+                    if (nested.Else is not null)
+                    {
+                        AddNames(nested.Else, names, ctx);
+                    }
+                    break;
+                case HlslLoopStatement loop:
+                    AddNames(loop.Body, names, ctx);
+                    break;
+                case HlslSwitchStatement sw:
+                    foreach (HlslSwitchCase c in sw.Cases)
+                    {
+                        AddNames(c.Body, names, ctx);
+                    }
+                    break;
+            }
+        }
     }
 
     // Names first written at the top level of a loop body that are not yet
@@ -2450,6 +2598,7 @@ public static class HlslPrettyPrinter
 
     private static string RenderExpression(IRExpression expr, PrintContext ctx) => expr switch
     {
+        IRExpression.BitFieldInsertExpression insert => RenderBitFieldInsert(insert, ctx),
         IRExpression.IntrinsicExpression i => RenderIntrinsic(i, ctx),
         IRExpression.FusedMultiplyAddExpression f => $"mad({RenderExpression(f.A, ctx)}, {RenderExpression(f.B, ctx)}, {RenderExpression(f.C, ctx)})",
         IRExpression.MatrixVectorMultiplyExpression mv => RenderMatrixMultiply(mv, ctx),
@@ -2458,7 +2607,7 @@ public static class HlslPrettyPrinter
         IRExpression.BinaryExpression b => $"({RenderExpression(b.Left, ctx)} {BinaryOpText(b.Operation)} {RenderExpression(b.Right, ctx)})",
         IRExpression.UnaryExpression u => RenderUnary(u, ctx),
         IRExpression.ConditionalExpression c => $"({RenderExpression(c.Condition, ctx)} ? {RenderExpression(c.TrueExpression, ctx)} : {RenderExpression(c.FalseExpression, ctx)})",
-        IRExpression.DotProductExpression d => $"dot({RenderExpression(d.Left, ctx)}, {RenderExpression(d.Right, ctx)})",
+        IRExpression.DotProductExpression d => RenderDotProduct(d, ctx),
         IRExpression.SwizzleExpression s => RenderSwizzle(s, ctx),
         IRExpression.RegisterExpression r => RenderRegisterRead(r.Register, ctx),
         IRExpression.ConstantExpression => expr.ToString()!,
@@ -2509,6 +2658,17 @@ public static class HlslPrettyPrinter
         return true;
     }
 
+    // Renders a dot product using only its active vector lanes.
+    private static string RenderDotProduct(IRExpression.DotProductExpression dot, PrintContext ctx)
+    {
+        if (dot.Components is < 2 or > 4)
+        {
+            throw new InvalidOperationException($"Unsupported dot-product width: {dot.Components}");
+        }
+        string lanes = "xyzw"[..dot.Components];
+        return $"dot(({RenderExpression(dot.Left, ctx)}).{lanes}, ({RenderExpression(dot.Right, ctx)}).{lanes})";
+    }
+
     private static string RenderUnary(IRExpression.UnaryExpression u, PrintContext ctx) => u.Operation switch
     {
         IRExpression.UnaryExpression.UnaryOperation.Negate => $"-{RenderExpression(u.Operand, ctx)}",
@@ -2550,6 +2710,10 @@ public static class HlslPrettyPrinter
 
     private static string RenderBitwise(IRExpression.BinaryExpression b, PrintContext ctx)
     {
+        if (ctx.RawTemporaryStorage)
+            {
+            return $"({RenderExpression(b.Left, ctx)} {BinaryOpText(b.Operation)} {RenderExpression(b.Right, ctx)})";
+        }
         string Op(IRExpression side)
         {
             string s = RenderExpression(side, ctx);
@@ -2591,14 +2755,39 @@ public static class HlslPrettyPrinter
         string Arg(int n) => RenderExpression(expr.Arguments[n], ctx);
         string AllArgs() => string.Join(", ", expr.Arguments.Select(a => RenderExpression(a, ctx)));
 
+        // Keep integer reads in integer storage: fxc can fold a known subnormal
+        // float round-trip to zero even when it only transports register bits.
+        if (ctx.RawTemporaryStorage && expr.Intrinsic is IRExpression.IRIntrinsic.AsUInt or IRExpression.IRIntrinsic.AsInt
+            && expr.Arguments[0] is IRExpression.RegisterExpression { Register: { } register }
+            && register.RegisterType is RegisterType.Temp or RegisterType.IndexableTemp
+            && register.Modifier == ShdrParser.OperandModifier.None)
+        {
+            string bits = RenderTempRead(register, ctx);
+            return expr.Intrinsic == IRExpression.IRIntrinsic.AsUInt ? bits : $"asint({bits})";
+        }
+
+        // fxc folds frac(x + integer) even with /Gis, losing the add's rounding.
+        // Use the DXBC definition of frc to retain that dependency.
+        if (ctx.RawTemporaryStorage && expr.Intrinsic == IRExpression.IRIntrinsic.FractionalPart)
+            {
+            return $"({Arg(0)} - floor({Arg(0)}))";
+        }
+
         // Casts use C-style cast syntax, not a function call.
         switch (expr.Intrinsic)
         {
-            case IRExpression.IRIntrinsic.CastFloat: return $"(float)({Arg(0)})";
-            case IRExpression.IRIntrinsic.CastInt: return $"(int)({Arg(0)})";
-            case IRExpression.IRIntrinsic.CastUInt: return $"(uint)({Arg(0)})";
-            case IRExpression.IRIntrinsic.CastDouble: return $"(double)({Arg(0)})";
-            case IRExpression.IRIntrinsic.CastBool: return $"(bool)({Arg(0)})";
+            case IRExpression.IRIntrinsic.CastFloat: return $"({CastType("float")})({Arg(0)})";
+            case IRExpression.IRIntrinsic.CastInt: return $"({CastType("int")})({Arg(0)})";
+            case IRExpression.IRIntrinsic.CastUInt: return $"({CastType("uint")})({Arg(0)})";
+            case IRExpression.IRIntrinsic.CastDouble: return $"({CastType("double")})({Arg(0)})";
+            case IRExpression.IRIntrinsic.CastBool: return $"({CastType("bool")})({Arg(0)})";
+        }
+
+        // Preserves the vector width when rendering a typed cast.
+        string CastType(string scalar)
+        {
+            int width = ExpressionWidth(expr.Arguments[0], ctx);
+            return width <= 1 ? scalar : $"{scalar}{width}";
         }
 
         string? name = expr.Intrinsic switch
@@ -2689,8 +2878,22 @@ public static class HlslPrettyPrinter
     // Load/Sample/SampleLevel/SampleBias/SampleGrad/Gather keep the same
     // name DXBC uses, only the Compare variants and argument order/style
     // needed fixing up from the debug ToString().
+    private static string RenderBitFieldInsert(IRExpression.BitFieldInsertExpression insert, PrintContext ctx)
+    {
+        // DXBC masks both counts to five bits; no shift by 32 is emitted.
+        string width = $"({RenderExpression(insert.Width, ctx)} & 31u)";
+        string offset = $"({RenderExpression(insert.Offset, ctx)} & 31u)";
+        string mask = $"(((1u << {width}) - 1u) << {offset})";
+        return $"((({RenderExpression(insert.Insert, ctx)} << {offset}) & {mask}) | ({RenderExpression(insert.Base, ctx)} & ~{mask}))";
+    }
+
     private static string RenderTextureOp(IRExpression.TextureOperationExpression tex, PrintContext ctx)
     {
+        if (tex.Operation == IRExpression.TextureOperation.LoadStructured)
+            {
+            return RenderStructuredLoad(tex, ctx);
+        }
+
         string resource = RenderRegisterRead(tex.Resource, ctx);
         string? sampler = tex.Sampler is null ? null : RenderRegisterRead(tex.Sampler, ctx);
         string? coord = tex.Coordinates is null ? null : RenderExpression(tex.Coordinates, ctx);
@@ -2742,5 +2945,95 @@ public static class HlslPrettyPrinter
             _ =>
                 $"/* TODO: no confirmed HLSL mapping for {tex.Operation} */ {resource}.{tex.Operation}({Args(sampler, coord)})",
         };
+    }
+
+    // Emits a valid stub when a pass contains no decompiled functions.
+    private static void PrintEmptyPassStub(StringBuilder sb, HlslPassNode pass)
+    {
+        // Empty pass (no decompiled functions) — emit a valid stub so
+        // pass indices stay stable for Graphics.Blit(material, passIndex).
+        bool hasAnyFunction = pass.VertexFunction is not null || pass.FragmentFunction is not null
+            || pass.GeometryFunction is not null || pass.HullFunction is not null
+            || pass.DomainFunction is not null || pass.ComputeFunction is not null;
+
+        if (!hasAnyFunction)
+        {
+            sb.AppendLine("            #pragma vertex vert");
+            sb.AppendLine("            #pragma fragment frag");
+            sb.AppendLine("            cbuffer _StubCB : register(b1) { float4x4 unity_MatrixVP; };");
+            sb.AppendLine("            struct v2f { float4 pos : SV_POSITION; };");
+            sb.AppendLine("            v2f vert(float4 v : POSITION) { v2f o; o.pos = mul(unity_MatrixVP, v); return o; }");
+            sb.AppendLine("            float4 frag(v2f i) : SV_Target { return 0; }");
+        }
+    }
+
+    // Prints the resources and interpolator structures shared by a pass.
+    private static void PrintPassDeclarations(StringBuilder sb, HlslPassNode pass, bool stripRegisterBindings, Dictionary<string, string> cbufferRenames)
+    {
+        foreach (HlslResourceNode res in pass.Resources)
+        {
+            PrintResource(sb, res, stripRegisterBindings, cbufferRenames);
+        }
+
+        foreach (HlslStructNode s in pass.Structs)
+        {
+            PrintStruct(sb, s);
+        }
+    }
+
+    // Renders structured-buffer reads with their byte offsets and swizzles.
+    private static string RenderStructuredLoad(IRExpression.TextureOperationExpression tex, PrintContext ctx)
+    {
+        uint? byteOffset = ValidateStructuredLoad(tex, ctx);
+        List<int> lanes = MaskIndices(tex.DestinationMask);
+        if (lanes.Count == 0)
+        {
+            throw new InvalidDataException("Structured load has no destination lanes.");
+        }
+        List<int> swizzle = ActiveComponents(tex.Resource);
+        List<string> values = new List<string>();
+        foreach (int lane in lanes)
+        {
+            string word;
+            if (byteOffset.HasValue)
+            {
+                uint index = byteOffset.Value / 4 + (uint)swizzle[lane];
+                if (index >= tex.StructuredStride / 4)
+                {
+                    throw new InvalidDataException($"Structured load exceeds element stride at t{tex.Resource.Index}.");
+                }
+                word = index.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+            else
+            {
+                word = $"(({RenderExpression(tex.Offset, ctx)}) >> 2) + {swizzle[lane]}u";
+            }
+            values.Add($"t{tex.Resource.Index}[{RenderExpression(tex.Coordinates, ctx)}].value[{word}]");
+        }
+        return lanes.Count == 1
+            ? $"asfloat({values[0]})"
+            : $"asfloat(uint{lanes.Count}({string.Join(", ", values)}))";
+    }
+
+    // Rejects unsupported storage and unaligned structured-load offsets.
+    private static uint? ValidateStructuredLoad(IRExpression.TextureOperationExpression tex, PrintContext ctx)
+    {
+        // Float temporaries can numerically convert integer outputs and lose payload bits.
+        if (!ctx.RawTemporaryStorage)
+        {
+            throw new InvalidDataException("Structured loads require raw register storage in the HLSL function.");
+        }
+
+        if (tex.Coordinates is null || tex.Offset is null)
+        {
+            throw new InvalidDataException("Structured load requires an element index and a byte offset.");
+        }
+        uint? byteOffset = tex.Offset is IRExpression.ConstantExpression { RawValues.Length: 1 } offset
+            ? offset.RawValues[0] : null;
+        if (byteOffset.HasValue && byteOffset.Value % 4 != 0)
+        {
+            throw new InvalidDataException($"Unaligned structured load offset {byteOffset.Value}.");
+        }
+        return byteOffset;
     }
 }

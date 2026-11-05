@@ -12,6 +12,7 @@ public static class IRPipeline
 {
     public sealed class Result
     {
+        public bool PreserveRegisterBits { get; init; }
         public required IRProgram Program { get; init; }
         public required List<IRBlock> Blocks { get; init; }
         public required IRSsaVerificationResult SsaVerification { get; init; }
@@ -24,8 +25,12 @@ public static class IRPipeline
         public List<(string Phase, string Text)> StageDumps { get; } = new();
     }
 
-    public static Result Run(DxbcFile file, bool dumpStages = false)
+    public static Result Run(DxbcFile file, bool dumpStages = false) => Run(file, dumpStages, false);
+
+    public static Result Run(DxbcFile file, bool dumpStages, bool preserveArithmetic)
     {
+        // Structured resources carry raw words regardless of the requested temp optimization.
+        preserveArithmetic |= file.Shader!.Instructions.Any(instruction => instruction.Opcode == Instructions.Opcode.LdStructured);
         var stageDumps = new List<(string Phase, string Text)>();
 
         void Snapshot(string phase, List<IRBlock> blocks)
@@ -42,7 +47,7 @@ public static class IRPipeline
         }
 
         // 1. Decode -> flat IR (no control flow structure yet)
-        var builder = new IRBuilder();
+        IRBuilder builder = new IRBuilder(preserveRegisterBits: preserveArithmetic);
         IRProgram program = builder.Build(file.Shader!);
 
         // 2. Split into basic blocks and wire up predecessors/successors
@@ -77,7 +82,10 @@ public static class IRPipeline
         //    is read-only so it doesn't matter when it runs relative to
         //    the others, but doing it here means it sees the same
         //    simplified shape as everything else.
-            IRShaderPatternRecognition.Run(blocks);
+            if (!preserveArithmetic)
+                {
+                IRShaderPatternRecognition.Run(blocks);
+            }
             Snapshot("05-pattern-recognized", blocks);
             List<IRLoopPatternRecognition.LoopInfo> loops = IRShaderPatternRecognition.DetectLoops(blocks);
 
@@ -111,6 +119,7 @@ public static class IRPipeline
 
         var result = new Result
         {
+            PreserveRegisterBits = preserveArithmetic,
             Program = program,
             Blocks = blocks,
             SsaVerification = ssaResult,

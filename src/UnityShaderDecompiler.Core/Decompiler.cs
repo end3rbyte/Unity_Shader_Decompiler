@@ -5,6 +5,7 @@ using System.Linq;
 using System.Security.Cryptography;
 using AssetStudio;
 using UnityShaderDecompiler.Core.Hlsl.Ast;
+using UnityShaderDecompiler.Core.Hlsl;
 using UnityShaderDecompiler.Core.DXBC;
 using UnityShaderDecompiler.Core.DXBC.Chunks;
 using UnityShaderDecompiler.Core.DXBC.Extraction;
@@ -20,6 +21,13 @@ namespace UnityShaderDecompiler.Core;
 /// </summary>
 public sealed class DecompileOptions
 {
+    /// <summary>Process only serialized Direct3D 11 subprograms.</summary>
+    public bool D3d11Only { get; init; }
+    /// <summary>Abort on decompilation errors instead of logging and continuing.</summary>
+    public bool FailOnError { get; init; }
+    /// <summary>Keep serialized passes and select their programs through Unity keywords.</summary>
+    public bool RestoreKeywordVariants { get; init; }
+
     /// <summary>Print the IR after every pipeline phase.</summary>
     public bool DumpStages { get; init; }
 
@@ -135,7 +143,8 @@ public static class Decompiler
         log.WriteLine("Loading SubPrograms...");
         log.WriteLine();
 
-        program.Read(reader, 0);
+        SerializedProgramReader.Read(program, reader, project.Metadata,
+            options.RestoreKeywordVariants, log);
 
         if (options.OutRoot is { } createRoot)
             Directory.CreateDirectory(createRoot);
@@ -157,6 +166,7 @@ public static class Decompiler
             .SelectMany(ss => ss.Passes)
             .ToList();
         var candidates = new List<DecompiledSubprogram>();
+        HashSet<int> failedPrograms = new HashSet<int>();
 
         for (int i = 0; i < program.m_SubPrograms.Length; i++)
         {
@@ -168,6 +178,14 @@ public static class Decompiler
             {
                 log.WriteLine("NULL");
                 log.WriteLine();
+                continue;
+            }
+
+            if (options.D3d11Only &&
+                (sp.m_ProgramType < ShaderGpuProgramType.DX11VertexSM40 ||
+                 sp.m_ProgramType > ShaderGpuProgramType.DX11DomainSM50))
+            {
+                log.WriteLine($"Skipped non-D3D11 subprogram {i}: {sp.m_ProgramType}");
                 continue;
             }
 
@@ -221,7 +239,7 @@ public static class Decompiler
                     log.WriteLine($"Saved: {dxbcPath}");
                 }
 
-                IRPipeline.Result pipelineResult = IRPipeline.Run(dxbcFile, options.DumpStages);
+                IRPipeline.Result pipelineResult = IRPipeline.Run(dxbcFile, options.DumpStages, preserveArithmetic: !options.FuseTemps);
 
                 if (options.DumpStages)
                 {
@@ -245,6 +263,11 @@ public static class Decompiler
 
                 if (!pipelineResult.SsaVerification.IsValid)
                 {
+                    if (options.FailOnError)
+                    {
+                        throw new InvalidDataException(
+                            $"SSA verification failed for subprogram {i}: {string.Join("; ", pipelineResult.SsaVerification.Errors)}");
+                    }
                     log.WriteLine("SSA verification FAILED:");
                     foreach (var error in pipelineResult.SsaVerification.Errors)
                         log.WriteLine($"  {error}");
@@ -314,6 +337,7 @@ public static class Decompiler
                 }
                 else
                 {
+                    function.RawTemporaryStorage = pipelineResult.PreserveRegisterBits;
                     candidates.Add(new DecompiledSubprogram
                     {
                         Index = i,
@@ -341,6 +365,12 @@ public static class Decompiler
             }
             catch (Exception ex)
             {
+                if (options.FailOnError)
+                {
+                    throw new InvalidDataException(
+                        $"Failed to decompile subprogram {i} ({sp.m_ProgramType}): {ex.Message}", ex);
+                }
+                failedPrograms.Add(i);
                 log.WriteLine($"No DXBC: {ex.Message}");
             }
 
@@ -352,7 +382,14 @@ public static class Decompiler
         // Stage 2b — recover the pass each candidate belongs to from the
         // serialization order and emit one pass per distinct compiled
         // (vertex, fragment) variant pair.
-        BuildVariantPasses(astShader, allPasses, candidates, log);
+        if (options.RestoreKeywordVariants)
+        {
+            BuildRuntimeVariantPasses(astShader, allPasses, candidates, project.Metadata.KeywordFlags, log);
+        }
+        else
+        {
+            BuildVariantPasses(astShader, allPasses, candidates, log, failedPrograms, options.FailOnError);
+        }
 
         log.WriteLine();
         log.WriteLine("HLSL AST (Stage 2)");
@@ -375,7 +412,7 @@ public static class Decompiler
         // original HLSLPROGRAM passes are kept as a comment only with
         // --keep-passes; by default the output is just the reconstructed
         // source so surface shaders match their original line count.
-        if (options.ReconstructSurfaceShaders)
+        if (options.ReconstructSurfaceShaders && !options.RestoreKeywordVariants)
         {
             string? reconstructed = HlslSurfaceShaderRecognizer.TryReconstruct(
                 text, project.Metadata, options.KeepPasses);
@@ -390,6 +427,10 @@ public static class Decompiler
         if (options.OutRoot is { } outRoot)
         {
             outputPath = Path.Combine(outRoot, SafeFileName(astShader.Name) + ".shader");
+            if (options.RestoreKeywordVariants)
+                {
+                RuntimeVariantManifest.Write(outputPath, text, astShader, candidates);
+            }
             File.WriteAllText(outputPath, text);
             log.WriteLine();
             log.WriteLine($"Stage 13/14: full shader written to {outputPath} ({text.Length} chars)");
@@ -462,21 +503,27 @@ public static class Decompiler
         HlslShaderNode astShader,
         List<HlslPassNode> allPasses,
         List<DecompiledSubprogram> candidates,
-        TextWriter log)
+        TextWriter log,
+        ISet<int> failedPrograms,
+        bool failOnError)
     {
         if (candidates.Count == 0)
+        {
+            if (failOnError && allPasses.Count > 0)
+            {
+                throw new InvalidDataException("No renderable subprograms were decompiled.");
+            }
             return;
+        }
 
-        // Build texture property name mapping: texture properties (type=4) in
-        // declaration order map to t-register slots (0, 1, 2, ...). This lets
-        // the decompiler emit "Texture2D _MainTex : register(t0)" instead of
-        // "Texture2D t0 : register(t0)" — Unity needs variable names matching
-        // the Properties block to bind textures at runtime.
-        var textureNames = new Dictionary<uint, string>();
-        uint texSlot = 0;
-        foreach (HlslPropertyNode prop in astShader.Properties)
-            if (prop.Kind == HlslPropertyKind.Texture)
-                textureNames[texSlot++] = prop.Name;
+        // Property order does not identify compiled resource binding slots.
+        Dictionary<uint, string> textureNames = new Dictionary<uint, string>();
+
+        if (allPasses.Any(p => p.DirectXPrograms.Count != 0))
+        {
+            BuildSerializedVariantPasses(astShader, allPasses, candidates, textureNames, log, failedPrograms);
+            return;
+        }
 
         foreach (DecompiledSubprogram c in candidates)
             c.Hash = Convert.ToHexString(SHA256.HashData(c.DxbcBytes));
@@ -546,12 +593,30 @@ public static class Decompiler
                 }
             }
 
+            // Reuse a serialized vertex when each metadata pass has its own fragment.
+            bool sharedVertexPasses = groups.Count == 1 && verts.Count == 1
+                && frags.Count == allPasses.Count && frags.Count > 1
+                && frags.All(f => verts[0].OutputInterpolators == f.InputInterpolators
+                    && verts[0].OutputSignature.Split(';', StringSplitOptions.RemoveEmptyEntries)
+                        .All(f.InputSignature.Split(';', StringSplitOptions.RemoveEmptyEntries).Contains));
+            if (sharedVertexPasses)
+            {
+                foreach (DecompiledSubprogram fragment in frags)
+                {
+                    if (usedFrags.Add(fragment))
+                    {
+                        pairs.Add((verts[0], fragment));
+                    }
+                }
+            }
+
             // First pair fills the shell pass; the rest get clones.
             for (int pi = 0; pi < pairs.Count; pi++)
             {
                 var (v, f) = pairs[pi];
-                HlslPassNode pass = pi == 0 ? shell : ClonePass(shell);
-                if (!ReferenceEquals(pass, shell))
+                HlslPassNode pass = sharedVertexPasses ? allPasses[pi]
+                    : pi == 0 ? shell : ClonePass(shell);
+                if (!sharedVertexPasses && !ReferenceEquals(pass, shell))
                 {
                     HlslSubShaderNode ss = subshaderByPass[shell];
                     int insertAt = ss.Passes.IndexOf(shell) + 1;
@@ -574,6 +639,10 @@ public static class Decompiler
 
             if (pairs.Count == 0 && others.Count == 0)
             {
+                if (failOnError)
+                {
+                    throw new InvalidDataException($"Pass group {gi} has no renderable variant.");
+                }
                 log.WriteLine($"  Pass group {gi}: {verts.Count} verts x {frags.Count} frags produced no renderable variant (skipped).");
             }
             else
@@ -587,6 +656,55 @@ public static class Decompiler
         }
 
         log.WriteLine($"BuildVariantPasses: {groups.Count} pass group(s), {totalPasses} pass(es) emitted total.");
+    }
+
+    // Expands serialized stage combinations while preserving failure policy.
+    private static void BuildSerializedVariantPasses(
+        HlslShaderNode shader, List<HlslPassNode> shells, List<DecompiledSubprogram> candidates,
+        Dictionary<uint, string> textureNames, TextWriter log, ISet<int> failedPrograms)
+    {
+        Dictionary<int, DecompiledSubprogram> byIndex = candidates.ToDictionary(c => c.Index);
+        HashSet<int> covered = new HashSet<int>();
+        foreach (HlslPassNode shell in shells)
+        {
+            if (shell.DirectXPrograms.Count == 0)
+            {
+                continue;
+            }
+            BuildSerializedPassGroups(shader, shell, byIndex, textureNames, log, failedPrograms, covered);
+        }
+        if (byIndex.Keys.Except(covered).Any())
+        {
+            throw new InvalidDataException("DXBC programs are missing from serialized variant coverage.");
+        }
+    }
+
+    // Builds keyword-selected variants for each serialized pass.
+    private static void BuildRuntimeVariantPasses(HlslShaderNode shader, List<HlslPassNode> shells,
+        List<DecompiledSubprogram> candidates, Dictionary<string, int> keywordFlags, TextWriter log)
+    {
+        Dictionary<int, DecompiledSubprogram> byIndex = candidates.ToDictionary(c => c.Index);
+        HashSet<int> covered = new HashSet<int>();
+        Dictionary<uint, string> textureNames = new Dictionary<uint, string>();
+        // Property declaration order is not a per-program texture binding table.
+        foreach (HlslPassNode shell in shells)
+        {
+            if (shell.DirectXPrograms.Count == 0)
+            {
+                throw new InvalidDataException("Runtime keyword reconstruction requires serialized program references for every pass.");
+            }
+            RuntimeVariantPlan plan = RuntimeVariantPlan.Build(shell.DirectXPrograms, keywordFlags);
+            shell.RuntimeVariants = plan;
+            foreach (RuntimeVariantState state in plan.States)
+            {
+                AttachRuntimeState(shell, state, byIndex, textureNames, log, covered);
+            }
+            log.WriteLine($"Runtime variants: {plan.States.Count} keyword states in one serialized pass.");
+        }
+        if (byIndex.Keys.Except(covered).Any())
+        {
+            throw new InvalidDataException("DXBC programs are missing from serialized variant coverage.");
+        }
     }
 
     // Attaches one candidate's function, resources and structs to a pass,
@@ -607,49 +725,9 @@ public static class Decompiler
             c.Stage.ToString(),
             textureNames).ToList();
 
-        foreach (HlslResourceNode res in resources)
+        foreach (HlslResourceNode resource in resources)
         {
-            // Cbuffers merge by slot: vert and frag subprograms of the same
-            // pass touch the same constant-buffer slots, so union the
-            // members (keeping the largest array size for any fallback).
-            HlslResourceNode? existing = pass.Resources.FirstOrDefault(r =>
-                r.Kind == res.Kind && (res.Kind == HlslResourceKind.ConstantBuffer
-                    ? r.Slot == res.Slot
-                    : r.Slot == res.Slot || r.Name == res.Name));
-
-            if (existing is null)
-            {
-                // Sampler name collision: two different sampler slots may both
-                // map to the same texture property (e.g. s0 and s2 both serve
-                // _MainTex). Append the slot index to make the name unique.
-                if (res.Kind == HlslResourceKind.Sampler
-                    && pass.Resources.Any(r => r.Kind == HlslResourceKind.Sampler && r.Name == res.Name))
-                {
-                    res.Name = $"{res.Name}{res.Slot}";
-                }
-                pass.Resources.Add(res);
-            }
-            else if (res.Kind == HlslResourceKind.ConstantBuffer)
-            {
-                // vert/frag subprograms of one pass can touch different
-                // slots of the same cbuffer, and each BuildResources call
-                // only sees its own blocks. Union the members, keeping the
-                // largest array size so the RDEF-less float4 fallback
-                // covers every subprogram's accesses.
-                foreach (HlslCBufferVariable v in res.Variables)
-                {
-                    HlslCBufferVariable? match = existing.Variables.FirstOrDefault(x => x.Name == v.Name);
-                    if (match is null)
-                    {
-                        existing.Variables.Add(v);
-                    }
-                    else if (v.ArraySize is { } n && (match.ArraySize is not { } m || n > m))
-                    {
-                        existing.Variables.Remove(match);
-                        existing.Variables.Add(v);
-                    }
-                }
-            }
+            VerifiedResourceBindings.Attach(pass.Resources, resource, c.Stage.ToString());
         }
 
         if (c.Function.InputStruct is not null) pass.Structs.Add(c.Function.InputStruct);
@@ -750,5 +828,98 @@ public static class Decompiler
         }
 
         return FindOutputRoot();
+    }
+
+    // Expands the compatible stage combinations for one serialized pass.
+    private static void BuildSerializedPassGroups(HlslShaderNode shader, HlslPassNode shell, Dictionary<int, DecompiledSubprogram> byIndex, Dictionary<uint, string> textureNames, TextWriter log, ISet<int> failedPrograms, HashSet<int> covered)
+    {
+        List<ProgramVariantMetadata[]> groups = VariantPairing.Group(shell.DirectXPrograms);
+        HlslSubShaderNode parent = shader.SubShaders.Single(ss => ss.Passes.Contains(shell));
+        int insertAt = parent.Passes.IndexOf(shell);
+        foreach (ProgramVariantMetadata[] group in groups)
+        {
+            if (group.Any(reference => failedPrograms.Contains(reference.BlobIndex)))
+            {
+                // Preserve the caller's existing log-and-continue failure policy.
+                covered.UnionWith(group.Select(reference => reference.BlobIndex));
+                log.WriteLine("Skipped serialized variant after a logged subprogram error.");
+                continue;
+            }
+            HlslPassNode pass = insertAt == parent.Passes.IndexOf(shell) ? shell : ClonePass(shell);
+            if (!ReferenceEquals(pass, shell))
+            {
+                parent.Passes.Insert(insertAt, pass);
+            }
+            AttachSerializedGroup(pass, group, byIndex, textureNames, log, covered);
+            insertAt++;
+        }
+        log.WriteLine($"Serialized variants: {groups.Count} stage combinations.");
+    }
+
+    // Validates adjacent stage interfaces and attaches a complete serialized group.
+    private static void AttachSerializedGroup(HlslPassNode pass, ProgramVariantMetadata[] group, Dictionary<int, DecompiledSubprogram> byIndex, Dictionary<uint, string> textureNames, TextWriter log, HashSet<int> covered)
+    {
+        DecompiledSubprogram? previous = null;
+        foreach (ProgramVariantMetadata reference in group)
+        {
+            if (!byIndex.TryGetValue(reference.BlobIndex, out DecompiledSubprogram? program))
+            {
+                throw new InvalidDataException("Serialized variant references a missing DXBC program.");
+            }
+            if (program.Stage.ToString() != reference.Stage)
+            {
+                throw new InvalidDataException("Serialized variant stage does not match its DXBC program.");
+            }
+            if (previous is not null && (previous.Dxbc.OutputSignature is null || program.Dxbc.InputSignature is null
+                || !VariantPairing.InterfacesMatch(previous.Dxbc.OutputSignature.Elements, program.Dxbc.InputSignature.Elements)))
+            {
+                throw new InvalidDataException($"Variant {previous.Index}/{program.Index} has incompatible interpolators.");
+            }
+            AttachPassProgram(pass, program, textureNames, log);
+            covered.Add(program.Index);
+            previous = program;
+        }
+    }
+
+    // Attaches both programs of one runtime keyword state.
+    private static void AttachRuntimeState(HlslPassNode shell, RuntimeVariantState state, Dictionary<int, DecompiledSubprogram> byIndex, Dictionary<uint, string> textureNames, TextWriter log, HashSet<int> covered)
+    {
+        if (!byIndex.TryGetValue(state.Vertex, out DecompiledSubprogram? vertex)
+            || !byIndex.TryGetValue(state.Fragment, out DecompiledSubprogram? fragment))
+        {
+            throw new InvalidDataException("Serialized variant references a missing DXBC program.");
+        }
+        if (vertex.Stage != HlslShaderStage.Vertex || fragment.Stage != HlslShaderStage.Fragment)
+        {
+            throw new InvalidDataException("Serialized variant stage does not match its DXBC program.");
+        }
+        if (vertex.Dxbc.OutputSignature is null || fragment.Dxbc.InputSignature is null
+            || !VariantPairing.InterfacesMatch(vertex.Dxbc.OutputSignature.Elements, fragment.Dxbc.InputSignature.Elements))
+        {
+            throw new InvalidDataException($"Variant {state.Vertex}/{state.Fragment} has incompatible interpolators.");
+        }
+        SetRuntimeShaderTarget(shell, vertex, fragment);
+        HlslPassNode leaf = ClonePass(shell);
+        AttachPassProgram(leaf, vertex, textureNames, log);
+        AttachPassProgram(leaf, fragment, textureNames, log);
+        shell.VariantPrograms.Add(leaf);
+        covered.Add(state.Vertex);
+        covered.Add(state.Fragment);
+    }
+
+    // Requires a common supported shader target across runtime variants.
+    private static void SetRuntimeShaderTarget(HlslPassNode shell, DecompiledSubprogram vertex, DecompiledSubprogram fragment)
+    {
+        uint major = Math.Max(vertex.Dxbc.Shader!.MajorVersion, fragment.Dxbc.Shader!.MajorVersion);
+        if (major is not (4 or 5))
+        {
+            throw new InvalidDataException("Runtime keyword reconstruction requires shader model 4 or 5.");
+        }
+        string target = major == 5 ? "5.0" : "4.0";
+        if (shell.VariantPrograms.Count != 0 && shell.ShaderTarget != target)
+        {
+            throw new InvalidDataException("Runtime variants with different shader targets are not supported.");
+        }
+        shell.ShaderTarget = target;
     }
 }

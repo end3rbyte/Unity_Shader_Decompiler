@@ -1,12 +1,15 @@
 namespace UnityShaderDecompiler.Core.DXBC.Chunks;
 
-// D3D11 "SFI0" ShaderInfo0 chunk. Layout matches the well-known
-// reverse-engineered d3dcompiler format (SharpDX / Wine / meson sfi0). It
-// carries the thread-group sizes (cNumThreads) that the STAT chunk alone
-// cannot, and the temp register count cTemps. Shader parser spec §8 lists
-// cTemps/cNumThreads as the survive-able shader-info fields.
+// SFI0 stores the shader's required feature flags as one 64-bit bitmask.
 public class Sfi0Chunk
 {
+    public ulong FeatureFlags { get; private set; }
+
+    /// <summary>False: SFI0 has feature flags, not shader statistics.</summary>
+    public bool HasLegacyStatistics => false;
+
+    // Retained for source/binary compatibility. These fields are never populated
+    // by SFI0; check HasLegacyStatistics before using them as statistics.
     public uint InputPrimitive;
     public uint OutputPrimitive;
     public uint MaxInputSignatureRegisterCount;
@@ -14,7 +17,7 @@ public class Sfi0Chunk
     public uint MaxInputPatchConstantSignatureRegisterCount;
     public uint MaxOutputPatchCount;
     public uint PatchConstantPrimitive;
-    public uint CTemps;                  // temp register count (see spec §8 table)
+    public uint CTemps;
     public uint CIndexableTemp;
     public uint CGsInstanceCount;
     public uint CControlPoints;
@@ -24,9 +27,9 @@ public class Sfi0Chunk
     public uint COutputs;
     public uint CInputs;
     public uint CPatchConst;
-    public uint CNumThreadsX;            // thread-group size X
-    public uint CNumThreadsY;            // thread-group size Y
-    public uint CNumThreadsZ;            // thread-group size Z
+    public uint CNumThreadsX;
+    public uint CNumThreadsY;
+    public uint CNumThreadsZ;
     public uint CGsOutputTopology;
     public uint CInputPrimitive;
     public uint CMaxOutputVertices;
@@ -45,40 +48,11 @@ public class Sfi0Chunk
 
     public void Read(BinaryReader reader)
     {
-        InputPrimitive = reader.ReadUInt32();
-        OutputPrimitive = reader.ReadUInt32();
-        MaxInputSignatureRegisterCount = reader.ReadUInt32();
-        MaxOutputSignatureRegisterCount = reader.ReadUInt32();
-        MaxInputPatchConstantSignatureRegisterCount = reader.ReadUInt32();
-        MaxOutputPatchCount = reader.ReadUInt32();
-        PatchConstantPrimitive = reader.ReadUInt32();
-        CTemps = reader.ReadUInt32();
-        CIndexableTemp = reader.ReadUInt32();
-        CGsInstanceCount = reader.ReadUInt32();
-        CControlPoints = reader.ReadUInt32();
-        COutputControlPoints = reader.ReadUInt32();
-        CTgsm = reader.ReadUInt32();
-        CInputGsInstanceCount = reader.ReadUInt32();
-        COutputs = reader.ReadUInt32();
-        CInputs = reader.ReadUInt32();
-        CPatchConst = reader.ReadUInt32();
-        CNumThreadsX = reader.ReadUInt32();
-        CNumThreadsY = reader.ReadUInt32();
-        CNumThreadsZ = reader.ReadUInt32();
-        CGsOutputTopology = reader.ReadUInt32();
-        CInputPrimitive = reader.ReadUInt32();
-        CMaxOutputVertices = reader.ReadUInt32();
-        COutputTopology = reader.ReadUInt32();
-        CMaxTemp = reader.ReadUInt32();
-        CMaxOutputPatchCount = reader.ReadUInt32();
-        CMaxGsInstanceCount = reader.ReadUInt32();
-        CMaxIndexableTemp = reader.ReadUInt32();
-        CMaxInputGsInstanceCount = reader.ReadUInt32();
-        CMaxOutputs = reader.ReadUInt32();
-        CMaxInputs = reader.ReadUInt32();
-        CMaxPatchConst = reader.ReadUInt32();
-        CMaxNumThreadsX = reader.ReadUInt32();
-        CMaxNumThreadsY = reader.ReadUInt32();
-        CMaxNumThreadsZ = reader.ReadUInt32();
+        if (reader.BaseStream.Length - reader.BaseStream.Position != sizeof(ulong))
+            {
+            throw new InvalidDataException("SFI0 chunk must contain exactly 8 bytes of feature flags.");
+        }
+
+        FeatureFlags = reader.ReadUInt64();
     }
 }

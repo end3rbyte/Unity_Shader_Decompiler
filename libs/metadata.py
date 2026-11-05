@@ -8,25 +8,29 @@ This does NOT touch m_CompressedBlob — that stays in blob.py/ShaderBlob.
 """
 
 import json
+from .shader_json import load_shader_json, parameter_offset
+import base64
+from .program_parameters import extract_program_parameters
 
 
 class ShaderMetadata:
     def __init__(self, json_path):
         self.json_path = json_path
-        with open(json_path, "r", encoding="utf8") as f:
-            self.data = json.load(f)
+        self.data = load_shader_json(json_path)
 
-    def build(self):
+    def build(self, blob=None):
         d = self.data
         parsed = d.get("m_ParsedForm", d)  # some exports nest under m_ParsedForm
+        program_parameters = extract_program_parameters(d, blob) if blob is not None else None
 
         return {
             "name": d.get("m_Name") or parsed.get("m_Name"),
             "properties": self._properties(parsed),
-            "subShaders": self._sub_shaders(parsed),
+            "subShaders": self._sub_shaders(parsed, program_parameters),
             "fallback": self._get(parsed, "m_FallbackName", ""),
             "customEditor": self._get(parsed, "m_CustomEditorName", ""),
             "keywords": self._get(parsed, "m_KeywordNames", []),
+            "keywordFlags": self._keyword_flags(parsed),
             "dependencies": self._get(parsed, "m_Dependencies", []),
             "disableNoSubshadersMessage": self._get(
                 parsed, "m_DisableNoSubshadersMessage", False
@@ -66,8 +70,9 @@ class ShaderMetadata:
             })
         return out
 
-    def _sub_shaders(self, parsed):
+    def _sub_shaders(self, parsed, program_parameters=None):
         subshaders = []
+        pass_index = 0
         for ss in self._get(parsed, "m_SubShaders", []):
             raw_passes = ss.get("m_Passes", [])
             # Union cbuffer layouts by buffer name across every pass of
@@ -77,11 +82,17 @@ class ShaderMetadata:
             # them), but the layout of a same-named buffer is identical
             # wherever it appears, so a pass that omits one can still name
             # its reads from another pass's copy.
-            name_layouts = self._name_layouts(raw_passes)
+            name_layouts = self._name_layouts(raw_passes) if program_parameters is None else None
+            passes = [self._pass(p, name_layouts, parsed.get("m_KeywordNames", []),
+                                 program_parameters is None) for p in raw_passes]
+            if program_parameters is not None:
+                for shader_pass in passes:
+                    shader_pass["programParameters"] = program_parameters[pass_index]
+                    pass_index += 1
             subshaders.append({
                 "tags": self._tags(ss.get("m_Tags", {})),
                 "lod": ss.get("m_LOD"),
-                "passes": [self._pass(p, name_layouts) for p in raw_passes],
+                "passes": passes,
             })
         return subshaders
 
@@ -107,7 +118,7 @@ class ShaderMetadata:
                     for v in b.get("m_VectorParams", []) or []:
                         entry = {
                             "name": index_to_name.get(v.get("m_NameIndex"), ""),
-                            "offset": v.get("m_Index", 0),
+                            "offset": parameter_offset(v),
                             "dim": v.get("m_Dim", 0),
                             "arraySize": v.get("m_ArraySize", 0),
                         }
@@ -117,7 +128,7 @@ class ShaderMetadata:
                     for m in b.get("m_MatrixParams", []) or []:
                         entry = {
                             "name": index_to_name.get(m.get("m_NameIndex"), ""),
-                            "offset": m.get("m_Index", 0),
+                            "offset": parameter_offset(m),
                             "rowCount": m.get("m_RowCount", 0),
                             "arraySize": m.get("m_ArraySize", 0),
                             "isMatrix": True,
@@ -127,7 +138,7 @@ class ShaderMetadata:
                             variables.append(entry)
         return layouts
 
-    def _pass(self, p, name_layouts=None):
+    def _pass(self, p, name_layouts=None, keyword_names=(), legacy_buffers=True):
         state = p.get("m_State", {})
         prog_keys = ["m_ProgVertex", "m_ProgFragment", "m_ProgGeometry",
                      "m_ProgHull", "m_ProgDomain", "m_ProgRayTracing"]
@@ -148,17 +159,54 @@ class ShaderMetadata:
             if subprograms:
                 programs[key[2:]] = {"subProgramCount": len(subprograms)}
 
-        return {
+        result = {
             "name": p.get("m_Name"),
             "nameIndices": name_to_index,
             "tags": self._tags(state.get("m_Tags", {})),
             "renderState": self._render_state(state),
             "programs": programs,
-            "constantBuffers": self._constant_buffers(p, prog_keys, index_to_name, name_layouts),
+            "directXPrograms": self._directx_programs(p, keyword_names),
             "textures": p.get("m_SerializedProgram", {}).get("m_TextureParameters", []),
             "samplers": p.get("m_SerializedProgram", {}).get("m_SamplerParameters", []),
             "keywords": p.get("m_NameIndices", []),
         }
+        if legacy_buffers:
+            result["constantBuffers"] = self._constant_buffers(p, prog_keys, index_to_name, name_layouts)
+        return result
+
+    # Preserves local/global keyword scope from serialized flags.
+    @staticmethod
+    def _keyword_flags(parsed):
+        flags = parsed.get("m_KeywordFlags")
+        if flags is None:
+            return {}
+        if isinstance(flags, str):
+            flags = list(base64.b64decode(flags, validate=True))
+        names = parsed.get("m_KeywordNames", [])
+        if (not isinstance(flags, list) or len(flags) != len(names)
+                or len(set(names)) != len(names)
+                or any(type(flag) is not int or not 0 <= flag <= 255 for flag in flags)):
+            raise ValueError("Invalid serialized shader keyword flags")
+        return dict(zip(names, flags))
+
+    # Extracts DirectX stage references and keyword masks.
+    @staticmethod
+    def _directx_programs(shader_pass, keyword_names):
+        result = []
+        for stage in ("Vertex", "Fragment", "Geometry", "Hull", "Domain"):
+            program = shader_pass.get("m_Prog" + stage, {})
+            for group in program.get("m_PlayerSubPrograms", []):
+                for entry in group:
+                    if not 15 <= entry["m_GpuProgramType"] <= 22:
+                        continue
+                    indices = entry["m_KeywordIndices"]
+                    mask = program["m_SerializedKeywordStateMask"]
+                    if any(not 0 <= index < len(keyword_names) for index in indices + mask):
+                        raise ValueError("Shader variant references an invalid keyword index")
+                    result.append({"stage": stage, "blobIndex": entry["m_BlobIndex"],
+                                   "keywords": sorted(keyword_names[index] for index in indices),
+                                   "keywordMask": sorted(keyword_names[index] for index in mask)})
+        return result
 
     def _constant_buffers(self, p, prog_keys, index_to_name, name_layouts=None):
         # Unity serializes the constant-buffer layout (name + per-variable
@@ -211,14 +259,14 @@ class ShaderMetadata:
                 for v in b.get("m_VectorParams", []) or []:
                     cb["variables"].append({
                         "name": index_to_name.get(v.get("m_NameIndex"), ""),
-                        "offset": v.get("m_Index", 0),
+                        "offset": parameter_offset(v),
                         "dim": v.get("m_Dim", 0),
                         "arraySize": v.get("m_ArraySize", 0),
                     })
                 for m in b.get("m_MatrixParams", []) or []:
                     cb["variables"].append({
                         "name": index_to_name.get(m.get("m_NameIndex"), ""),
-                        "offset": m.get("m_Index", 0),
+                        "offset": parameter_offset(m),
                         "rowCount": m.get("m_RowCount", 0),
                         "arraySize": m.get("m_ArraySize", 0),
                         "isMatrix": True,

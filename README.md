@@ -9,8 +9,8 @@
 **Turn compiled Unity shaders back into readable ShaderLab and HLSL.**
 
 Unity ships shaders as LZ4-compressed blobs of stripped D3D11 DXBC bytecode.
-This project takes the JSON that [AssetStudio](https://github.com/Perfare/AssetStudio)
-exports for a `Shader` asset, recovers the serialized ShaderLab metadata, and
+This project accepts `Shader` JSON exports from [AssetStudio](https://github.com/Perfare/AssetStudio)
+or AssetRipper, recovers the serialized ShaderLab metadata, and
 decompiles every shipped GPU program through a typed SSA IR into per-pass HLSL.
 
 > Not affiliated with, sponsored by, or endorsed by Unity Technologies.
@@ -104,13 +104,23 @@ pip install lz4
 python Extract.py shaders_json/HOLO_Holo.json
 ```
 
+Extraction accepts legacy and current parameter-offset fields without rewriting
+the source JSON. Missing or invalid offsets and conflicting schema aliases fail explicitly.
+
 `Extract.py` writes `Output/HOLO_Holo/`:
 
 | File | Contents |
 | --- | --- |
 | `blob.bin` | `m_CompressedBlob`, base64-decoded and LZ4-decompressed |
-| `metadata.json` | flattened `m_ParsedForm`: properties, subshaders, render state, cbuffer layouts |
+| `metadata.json` | flattened `m_ParsedForm` and, when present, exact per-program D3D11 parameter records |
 | `dummy.shader` | optional plain-text reference from `shaders_dummy/`, when a match exists |
+
+For exports with `m_ParameterBlobIndices`, each pass has `programParameters`
+entries keyed by stage, tier, program position, code index, and parameter index.
+Binary and common parameters remain separate. The C# loader rejects these
+entries until HLSL resource binding consumes them; it will not substitute the
+legacy cross-pass constant-buffer layout. Check DXBC declaration coverage with
+`dotnet run --project tests/ParameterSlotsVerifier -- Output/<Name>`.
 
 Then build and run the decompiler:
 
@@ -146,6 +156,7 @@ directory and then one level up.
 | --- | --- |
 | `--out-root <dir>` | Write the `.shader` and subprogram artifacts to `<dir>` |
 | `--dump-stages` | Print the IR after every pipeline phase |
+| `--no-fuse-temps` | Preserve raw register bits and arithmetic order; disable temporary fusion |
 | `--save-subprograms` | Write per-subprogram `.bin`, `.dxbc`, and disassembly files |
 | `--no-surface-shaders` | Emit raw HLSLPROGRAM passes instead of surface-shader form |
 | `--keep-passes` | Keep original passes as comments when a surface shader is recognized |
@@ -160,7 +171,7 @@ directory and then one level up.
 
 | Argument | Default | Effect |
 | --- | --- | --- |
-| `json_path` (positional) | — | AssetStudio JSON export to process |
+| `json_path` (positional) | — | AssetStudio or AssetRipper Shader JSON export to process |
 | `--dummy-dir` | `shaders_dummy` | Directory to search for the matching `.shader` reference |
 | `--out-dir` | `Output` | Root output directory |
 | `--flat` | off | Write the three files directly into `--out-dir` instead of a per-shader subfolder |
@@ -176,8 +187,9 @@ and spaces are stripped).
 | `--out-root <dir>` | Write `.shader` output and subprogram artifacts to `<dir>` instead of the project-local `Output/` |
 | `--dump-stages` | Print a full IR snapshot after every pipeline phase and every optimization pass |
 | `--dump-keywords` | Print each subprogram's global and local keyword sets |
+| `--fail-on-error` | Stop with a non-zero exit code on subprogram errors, invalid SSA, missing input, or a pass group with no renderable variant (default: off) |
 | `--save-subprograms` | Also write per-subprogram `program{i}.bin`, `program{i}.dxbc`, and `program{i}.hlsl` (disassembly) |
-| `--no-fuse-temps` | Disable temp fusion; keep every SSA copy as a separate statement |
+| `--no-fuse-temps` | Keep raw uint temporary storage with typed reads and outputs; disable temporary fusion and arithmetic rewrites |
 | `--no-surface-shaders` | Disable surface-shader recognition; emit raw reconstructed HLSLPROGRAM passes |
 | `--keep-passes` | When a pass is recognized as a surface shader, keep the original compiled passes as comments |
 | `--keep-register-bindings` | Keep explicit `register(tN)` / `register(bN)` bindings (stripped by default) |
@@ -194,7 +206,7 @@ and spaces are stripped).
 ## How it works
 
 ```
-AssetStudio JSON export
+AssetStudio / AssetRipper JSON export
   └─ Stage 0: base64 + LZ4 → blob.bin + metadata.json
        └─ Stage 1: DXBC → typed IR → SSA → optimize → HLSL AST → .shader
 ```
@@ -220,7 +232,10 @@ Each subprogram goes through `IRPipeline` (`DXBC/IR/IRPipeline.cs`):
    DXBC container.
 2. **Container parse** — validate the `DXBC` magic and lengths; parse `ISGN`,
    `OSGN`, `OSG5`, `PSGN`, `PCON`, `SFI0`, `RDEF`, `STAT`, and the
-   `SHDR`/`SHEX` shader chunk. Unknown chunks are preserved raw.
+   `SHDR`/`SHEX` shader chunk. `SFI0` is read as a 64-bit feature mask; invalid
+   lengths are rejected. Legacy public statistic fields remain for compatibility;
+   `HasLegacyStatistics` is false because SFI0 does not contain those values.
+   Unknown chunks are preserved raw.
 3. **Instruction decode** — decode every SM4/SM5 instruction and operand.
 4. **IR build** — build flat, typed IR statements.
 5. **CFG** — build basic blocks and edges.
@@ -234,16 +249,32 @@ Each subprogram goes through `IRPipeline` (`DXBC/IR/IRPipeline.cs`):
    iterations.
 8. **Pattern recognition** — fold shader idioms back into high-level IR with
    the matrix, vector, texture, loop, and shader-pattern recognizers.
-9. **Leave SSA** — eliminate phis and coalesce copies.
+   Explicit texture LODs, including zero, remain explicit in emitted HLSL.
+   The public `IRTexturePatternRecognition.Run` entry point remains available
+   as a no-op for existing callers.
+9. **Leave SSA** — eliminate phis and coalesce copies. Copies follow their
+   conditional join; branch-written values remain in scope for subsequent reads.
 10. **Metadata binding** — attach RDEF/ISGN/OSGN symbolic names to the IR.
+    Same-named resources keep distinct binding slots; raw constant-buffer fallback
+    storage preserves the serialized extent and starts at byte zero.
+    Temporary names retain register identity to avoid collisions.
+    Resource names must come from reflection or binding metadata, never property
+    order. Missing names, unresolved constant-buffer reads, overlapping layouts
+    and incompatible stage bindings stop emission. Partial metadata cannot replace
+    named uniforms with raw arrays. Existing stripped fixtures require complete
+    parameter extraction before they can pass this stricter contract.
+
 11. **AST build** — one function node per subprogram; the
     Shader/SubShader/Pass shell comes from `metadata.json`.
-12. **Pass and variant recovery** — `BuildVariantPasses` groups subprograms
-    into passes. Unity serializes them pass-by-pass, so a stage regression
-    marks a pass boundary. Vertex and fragment variants are paired by
-    interpolator hand-off signature, and byte-identical pairs are deduplicated.
+12. **Pass and variant recovery** — use serialized program references when
+    available, pairing stages whose enabled keywords agree within their shared
+    keyword masks, including Geometry/Hull/Domain in expanded passes. Validate
+    stage interfaces; older metadata falls back to
+    serialization order and signatures. Byte-identical pairs are deduplicated.
 13. **Pretty print** — emit properties, tags, LOD, render state,
-    `HLSLPROGRAM` blocks, structs, resources, and function bodies.
+    `HLSLPROGRAM` blocks, structs, resources, and function bodies. Numeric literals
+    use a decimal point regardless of system locale (for example, `0.5`, not `0,5`).
+    Vector casts and dot-product operands keep their required component widths.
 14. **Surface-shader recognition** — rewrite a pass to `#pragma surface` form
     when it carries the compiled signature of a surface shader.
 
@@ -316,10 +347,31 @@ root, prefixing each with
 
 ## Limitations
 
+With `--no-fuse-temps`, saturated moves clamp floating-point values before
+storing raw bits. Integer reads remain in integer storage, preserving low-bit
+conditions that fxc can otherwise fold away through a float round trip.
+
+Serialized integer properties (type 5) emit as ShaderLab `Integer`, preserving
+the integer bits stored in the float default slot. Non-finite JSON defaults are
+rejected because their original integer payload cannot be recovered reliably.
+
 - Targets Unity 2022.3 D3D11 shader blobs.
+- Structured-buffer loads work with the default options and `--no-fuse-temps`.
+  Their functions automatically retain raw register storage and skip unsafe
+  temporary fusion. Strides, constant/dynamic byte offsets and swizzles are
+  preserved; invalid constant offsets fail explicitly. Existing public IR
+  entry points and texture-operation enum values are retained.
 - Vertex and fragment stages are fully reconstructed. Hull, geometry, domain,
   and compute programs are parsed and IR-built, but the AST/emit path mainly
   targets vertex/fragment; other stages attach by serialization order.
+- By default, compatible keyword variants are emitted as separate passes.
+  `--restore-keyword-variants` keeps the original passes and restores D3D11
+  keyword selection for complete, unambiguous vertex/fragment variant sets.
+  It requires serialized program references and keyword scope flags; missing,
+  correlated or unsupported states fail explicitly. Surface rewrites are disabled
+  in this mode. The adjacent `.variants.json` lets `--recompile-verify` compile
+  every recovered combination and rejects stale shader/manifest pairs.
+  [Unity GPU checks](tests/UnityRuntime/README.md) target **6000.0.75f1**.
 - Surface-shader rewrites are gated on recompiled signature matches. Passes
   that do not match are emitted as HLSLPROGRAM.
 - Passes declared in metadata with no compiled DX11 variants in the blob are
@@ -408,6 +460,10 @@ If you change the pretty printer or surface-shader recognition, keep
   P/Invoke used for disassembly and recompilation.
 - The reverse-engineering notes in `docs/` document the UnityShaderCompiler work
   this project is built on.
+
+## VolumetricLights regression corpus
+
+The [VolumetricLights fixtures](tests/Fixtures/VolumetricLights/README.md) add three BSD-licensed shaders compiled with Unity 6000.0.75f1 / D3D11. Run `python tests/e2e/test_volumetric_lights.py` after building the Release CLI. It checks all 199 expected DirectX programs and requires [PR #6](https://github.com/Abby1591/Unity_Shader_Decompiler/pull/6): the three shader cases fail before that schema fix and pass afterward. It does not claim generated-HLSL compilation or rendering equivalence.
 
 ## License
 
